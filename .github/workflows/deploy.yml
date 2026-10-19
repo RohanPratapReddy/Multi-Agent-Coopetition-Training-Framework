@@ -4,6 +4,7 @@ name: Deploy
 #
 #   push tag v1.0.0      -> test, build, publish to PyPI, verify install, GitHub release
 #   push tag v1.1.0rc1   -> test, build, publish to TestPyPI only
+#   push tag v0.0.0rc1   -> current pre-release: TestPyPI only
 #   manual dispatch      -> test, build, then whatever `target` says
 #
 # Publishing uses OIDC Trusted Publishing, so no API token is stored in the repo.

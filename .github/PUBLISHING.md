@@ -43,14 +43,25 @@ the upload. The build artifact is still uploaded on every run, so nothing is los
 
 ## 3. Release
 
+The version currently in `mactf/__init__.py` is `0.0.0rc1`, which is a
+**pre-release**: tag it and it goes to TestPyPI, never PyPI. Use this flow first.
+
+```powershell
+# 1. tag the pre-release and push
+git tag v0.0.0rc1
+git push origin v0.0.0rc1
+```
+
+For a final release, bump the single source of truth and tag the same number:
+
 ```powershell
 # 1. bump the single source of truth
-#    mactf/__init__.py -> __version__ = "1.0.1"
+#    mactf/__init__.py -> __version__ = "0.1.0"
 git add mactf/__init__.py
-git commit -m "Release 1.0.1"
+git commit -m "Release 0.1.0"
 
 # 2. tag and push
-git tag v1.0.1
+git tag v0.1.0
 git push origin main --tags
 ```
 
@@ -67,18 +78,19 @@ resolve -> test (3.10, 3.11, 3.12, 3.13) -> build -> publish-pypi
 
 ## 4. Pre-release
 
-A tag whose version has a letter suffix goes to TestPyPI and stops there:
+A tag whose version has a letter suffix goes to TestPyPI and stops there. This is
+what the current `0.0.0rc1` is for:
 
 ```powershell
-git tag v1.1.0rc1
-git push origin v1.1.0rc1
+git tag v0.0.0rc1
+git push origin v0.0.0rc1
 ```
 
 TestPyPI cannot resolve `torch` from its index, so this path validates packaging
 metadata and the upload flow, not a full install. The version-format test is:
 
-- `v1.0.1` -> numeric only -> PyPI
-- `v1.1.0rc1`, `v2.0.0b3`, `v1.2.0.dev4` -> has a letter/`dev` suffix -> TestPyPI
+- `v0.1.0` -> numeric only -> PyPI
+- `v0.0.0rc1`, `v2.0.0b3`, `v1.2.0.dev4` -> has a letter/`dev` suffix -> TestPyPI
 
 ## 5. Manual dry run
 

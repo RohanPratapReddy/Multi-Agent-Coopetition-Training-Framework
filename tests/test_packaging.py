@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 
 try:
@@ -28,7 +29,11 @@ def test_pyproject_version_matches_package():
 
     assert data["project"]["name"] == "mactf"
     assert mactf.__version__ == __version__
-    assert mactf.VERSION == tuple(int(p) for p in __version__.split("."))
+    # VERSION is the numeric release segment, so pre-release suffixes are dropped
+    # rather than raising on int("0rc1").
+    assert mactf.VERSION == tuple(
+        int(part) for part in re.match(r"\d+(?:\.\d+)*", __version__).group(0).split(".")
+    )
 
 
 def test_pyproject_declares_runtime_contract():

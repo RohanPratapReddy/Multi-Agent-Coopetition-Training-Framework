@@ -8,7 +8,14 @@ normative rules in ``docs/framework.md``.
 
 from __future__ import annotations
 
-__version__ = "0.0.0"
-VERSION = tuple(int(part) for part in __version__.split("."))
+import re
+
+# Single source of truth: pyproject.toml resolves this dynamically and the
+# release workflow gates the git tag against it.
+__version__ = "0.0.0rc1"
+
+# Numeric release segment only, so pre-release suffixes survive: "1.2.3rc1" -> (1, 2, 3).
+_RELEASE = re.match(r"\d+(?:\.\d+)*", __version__)
+VERSION = tuple(int(part) for part in _RELEASE.group(0).split(".")) if _RELEASE else ()
 
 __all__ = ["__version__", "VERSION"]

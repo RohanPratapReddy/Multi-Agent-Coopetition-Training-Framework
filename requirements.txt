@@ -1,0 +1,32 @@
+# Reproducible development environment for MACTF.
+#
+#   python -m pip install -r requirements.txt
+#
+# This pins the exact versions this release was verified against on Windows 11
+# with torch 2.10.0+cu126 (NVIDIA RTX 4070 Laptop). The `-e .` line installs the
+# project itself, so `mactf` and `python -m mactf` both work from a checkout.
+#
+# CUDA: the `+cu126` local version below cannot resolve from PyPI. Either keep the
+# CUDA build you already have, or reinstall torch from the matching index:
+#
+#   python -m pip install --index-url https://download.pytorch.org/whl/cu126 torch==2.10.0
+#   python -m pip install -r requirements.txt
+#
+# CPU-only: replace the torch pin with `torch==2.10.0` from PyPI.
+
+-e .
+
+# runtime
+torch==2.10.0
+PyYAML==6.0.3
+numpy==2.4.0
+
+# tests and quality gates
+pytest==9.0.2
+pytest-cov==7.0.0
+ruff==0.16.4
+mypy==2.3.1
+
+# release tooling
+build==1.6.1
+twine==7.0.0

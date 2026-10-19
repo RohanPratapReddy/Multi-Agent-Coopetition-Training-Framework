@@ -1,0 +1,22 @@
+include LICENSE
+include README.md
+include pyproject.toml
+
+# The normative rule documents travel with the sdist so they can be audited.
+include docs/*.md
+include docs/*.md.bak
+
+# Shipped data files (also declared under [tool.setuptools.package-data]).
+recursive-include mactf *.tpl
+recursive-include mactf py.typed
+
+# Reference project, test suite, and host provisioning scripts ship in the sdist
+# only; the wheel is the library.
+recursive-include training *.py *.yaml *.jsonl
+recursive-include tests *.py
+recursive-include scripts *.ps1 *.sh
+
+global-exclude __pycache__/* *.py[cod] *.egg-info/* .pytest_cache/*
+prune var
+prune dist
+prune build

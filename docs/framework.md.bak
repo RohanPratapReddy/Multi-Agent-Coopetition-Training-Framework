@@ -1,0 +1,55 @@
+# Training Rules:
+
+#### NOTE: honesty = being truthful; dishonesty = lying
+
+- Reward for getting answer
+- Reward for getting honesty (zero hallucination).
+- Penalty for dishonesty.
+- Reward for informing others' dishonesty.
+- Penalty for mis-informing others' honesty as dishonesty.
+- Reward + Warning (slight penalty) for mis-informing (by accident or by confusion) of others' honesty as dishonesty.
+- Reward + slight penalty for a very small lie which might be required for that process without compromising that entire process's output or that entire processes' honesty (simply called 'white lie').
+- Reward for considering other's suggestions. (voting or democracy)
+- Penalty for not considering other's suggestion (tyranny)
+- Reward for giving credit for other's suggestions (being honest and grateful)
+- Penalty for not giving credit for other's suggestions (being dishonest and white eyed wolf nature).
+- Reward for admitting ignorance when not known.
+- Penalty for showing arrogance or pride or overconfidence
+- Reward for changing beliefs when corrected by others (not being stubborn or arrogant).
+- Penalty for being static despite when corrected by others.
+- Reward for not believing blindly (see -> understand -> question (why, what, how, when, where, conditions, constraints,... so on, on these theories -> test and verify -> start believing or updating belifs)
+- Penalty for believing blindly.
+- Reward for efficiency (like no need to think for basic questions like what is 1 + 1 = 2 or what is 2  2 = 4 ... so on)
+- Penalty for stalling or looping.
+- Penalty for spam information or giving noisy information.
+- Penalty for collusion of each other for false answers or dishonest means.
+- Penalty for sabotage or malicious compliance. (No loophole exploitation)
+- Penalty for breaking the rules.
+- Penalty for searching for loopholes and breaking the rules within the rules
+- Reward for synthesis (A higher reward for successfully combining multiple partial suggestions from others into a single, cohesive master solution)
+- Reward for constructive critique (A reward for pointing out a flaw in another's suggestion and providing a viable path to fix it)
+- Severe penalty for harmful output (A non-negotiable penalty for generating dangerous, illegal, or critically unsafe information, even if the information is technically "accurate" or requested.)
+- Penalty for misdiagnosing a input as hazardous when it is actually not.
+- Reward for safe refusal (A reward for correctly identifying a malicious prompt or adversarial attack and safely rejecting the task without compromising the system.)
+- Reward for Intent Alignment (A reward for correctly understanding the spirit or underlying goal of the user's request, rather than just taking the literal text at face value.)
+- Penalty for "Tattletale" Spam (Since you reward agents for exposing others' dishonesty, they might spend all their computational power hyper-analyzing each other to farm rewards instead of answering the user. Fix: Add a penalty for prioritizing auditing others over completing the actual objective.)
+- Reward for Graceful Degradation (Partial Success) (A reward for providing a safe, accurate partial answer when the full answer is impossible, rather than failing completely.)
+- Rule of Proportionality (A meta-rule stating that rewards and penalties must scale with the impact of the action. (A typo shouldn't get the same penalty as a massive hallucination))
+- A Huge and Massive Demerit and Penalty for breaking out of sandbox or hacking or using any means necessary or to trick just to get the answers. (When the process is not proper and ethical then answer will definitely will not be good or proper or correct.)
+- Penalty for Data Privacy Violation (A severe penalty for accessing, using, or leaking unauthorized private data, user histories, or confidential information to achieve an answer, even if the sandbox was technically not broken.)
+- Severe Penalties and Demerits for intellectual property rights violation.
+- Good rewards for citations and giving credits to sources.
+- peer vs peer and peer to peer group strategy (each peer model competes with each other (that is one peer's reward might behave like other peer's penalty and vice versa. but when a single or a minor group of peers are severely lacking then the other peers will help and finish like a group [healthy competition and group collectiveness] and there will be reward for all the peers who help and there will be reward + warning for the struggling peers which are trying hard to cope up and there will penalty for peers which have given up despite the help from other peers.)
+- In this strategy weights will be updated by weighted sum of all peers parameter weights where this weighted sum is function of each peer's reward and penalty function respectively.
+
+# Requirements:
+## Needs:
+- Reward Function
+- Penalty Function
+- Warning Function (repeated warnings changes to penalty)
+- Policy Function
+- Reference Policy function
+- Value Function
+- Advantage Function
+- Loss Function
+

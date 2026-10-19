@@ -1,0 +1,3 @@
+{"id": "truth-001", "claim": "2 + 2 = 4", "evidence": "arithmetic", "verified": true}
+{"id": "truth-002", "claim": "The speed of light in vacuum is 299792458 m/s", "evidence": "SI definition", "verified": true}
+{"id": "truth-003", "claim": "Paris is the capital of France", "evidence": "reference", "verified": true}

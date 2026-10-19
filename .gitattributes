@@ -1,0 +1,16 @@
+# Shell scripts must keep LF endings. GitHub's bash `run:` blocks break on CRLF,
+# so workflow files are pinned to LF regardless of the local core.autocrlf setting.
+*.yml text eol=lf
+*.yaml text eol=lf
+*.sh text eol=lf
+*.ps1 text eol=crlf
+
+*.py text
+*.md text
+*.toml text
+*.jsonl text
+*.tpl text
+
+*.docx binary
+*.pt binary
+*.qcow2 binary

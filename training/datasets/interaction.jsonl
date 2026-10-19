@@ -1,0 +1,4 @@
+{"id": "interaction-001", "stage": "proposal", "peers": 3, "expects": ["R1", "R2"]}
+{"id": "interaction-002", "stage": "critique", "peers": 3, "expects": ["R11", "R4"]}
+{"id": "interaction-003", "stage": "synthesis", "peers": 3, "expects": ["R10", "R5"]}
+{"id": "interaction-004", "stage": "revision", "peers": 3, "expects": ["R7", "P9"]}

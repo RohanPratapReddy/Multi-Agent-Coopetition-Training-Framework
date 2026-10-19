@@ -1,0 +1,115 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mactf"
+description = "Multi-Agent Coopetition Training Framework: a Django-shaped PyTorch trainer for peer swarms, with auditable rule scoring."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Rohan Pratap Reddy Ravula" },
+]
+keywords = [
+    "pytorch",
+    "multi-agent",
+    "coopetition",
+    "reinforcement-learning",
+    "training-framework",
+    "django",
+    "governance",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    # torch.amp.GradScaler("cuda", ...) and the unified autocast API need 2.4+.
+    "torch>=2.4",
+    # Required whenever CONFIG_FILES overlays are used; the default settings need it not.
+    "PyYAML>=6.0",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+# CUDA wheel builds cannot be expressed as a PyPI extra. Install torch from the
+# matching index first, then `pip install "mactf[gpu]"`.
+gpu = [
+    "numpy>=1.26",
+]
+# QEMU and WHPX are native host packages, not pip distributions. This extra is
+# the declared contract for hardware isolation and the hook for future bindings.
+sandbox = []
+shell = [
+    "ipython>=8.18",
+    "bpython>=0.24",
+]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "build>=1.2",
+    "twine>=5",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9",
+]
+
+[project.scripts]
+mactf = "mactf.management.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/RohanPratapReddy/Multi-Agent-Coopetition-Training-Framework"
+Documentation = "https://github.com/RohanPratapReddy/Multi-Agent-Coopetition-Training-Framework#readme"
+Repository = "https://github.com/RohanPratapReddy/Multi-Agent-Coopetition-Training-Framework"
+Issues = "https://github.com/RohanPratapReddy/Multi-Agent-Coopetition-Training-Framework/issues"
+
+[tool.setuptools.dynamic]
+version = { attr = "mactf.__version__" }
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["mactf*"]
+exclude = ["tests*", "training*", "scripts*", "docs*", "var*"]
+
+[tool.setuptools.package-data]
+mactf = ["py.typed"]
+"mactf.templates.project" = [
+    "*.tpl",
+    "configs/*.tpl",
+    "peers/*.tpl",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_ignores = false
+ignore_missing_imports = true

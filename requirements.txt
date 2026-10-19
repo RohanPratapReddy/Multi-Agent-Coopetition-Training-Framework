@@ -27,6 +27,9 @@ pytest-cov==7.0.0
 ruff==0.16.4
 mypy==2.3.1
 
+# tests/test_packaging.py falls back to tomli before 3.11.
+tomli==2.5.0; python_version < "3.11"
+
 # release tooling
 build==1.6.1
 twine==7.0.0

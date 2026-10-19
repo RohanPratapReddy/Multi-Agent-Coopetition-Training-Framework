@@ -114,6 +114,15 @@ class LocalSandbox(SandboxProvider):
             "MACTF_SANDBOX": self.name,
             "MACTF_ISOLATION": self.isolation.label,
         }
+        if sys.platform == "win32":
+            # CPython below 3.11 on Windows seeds hash randomization from the
+            # system RNG, which it locates through SYSTEMROOT. Without it every
+            # child interpreter aborts during initialization, so this one host
+            # variable is passed through rather than scrubbed.
+            for name in ("SYSTEMROOT", "SystemRoot"):
+                value = os.environ.get(name)
+                if value:
+                    env[name] = value
         started = time.monotonic()
         try:
             completed = subprocess.run(  # noqa: S603 - explicit args, no shell injection

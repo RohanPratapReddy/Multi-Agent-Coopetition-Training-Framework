@@ -64,6 +64,8 @@ dev = [
     "mypy>=1.10",
     "build>=1.2",
     "twine>=5",
+    # tests/test_packaging.py falls back to tomli before 3.11.
+    "tomli>=2.0; python_version < '3.11'",
 ]
 docs = [
     "mkdocs>=1.6",

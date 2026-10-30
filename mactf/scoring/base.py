@@ -31,7 +31,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from inspect import Parameter, signature
 from typing import Any, ClassVar, Mapping
 
 from ..exceptions import ValidationError
@@ -223,39 +222,37 @@ class Scorer(ABC):
     def from_spec(cls, spec: Mapping[str, Any]) -> "Scorer":
         """Build a stage from ``{"type": <registry key>, **kwargs}``.
 
-        The uniform spec shape lives here so every subclass gets the same
-        validation for free: unknown keys and unknown types raise
-        :class:`~mactf.exceptions.ValidationError` listing what is accepted,
-        rather than silently constructing the wrong objective.
+        Resolved through the ``scorer`` component registry, so a stage registered by a
+        plugin or a project is addressable here exactly like a built-in one. Unknown keys
+        and unknown types raise :class:`~mactf.exceptions.ValidationError` listing what is
+        accepted, rather than silently constructing the wrong objective.
         """
-        payload = dict(spec or {})
-        kind = payload.pop("type", None)
-        # Imported here rather than at module scope: ``registry`` imports every
-        # concrete stage, which imports this module.
-        from .registry import SCORER_TYPES
+        from ..components import HUB
+        from ..components.resolver import ComponentResolver, ComponentSpec
 
-        if kind is None:
+        payload = dict(spec or {})
+        if payload.get("type") is None and payload.get("import") is None:
             raise ValidationError(
                 f"{cls.__name__}.from_spec requires a 'type' key; accepted types: "
-                f"reward, penalty, warning, hierarchy"
+                + ", ".join(HUB.registry("scorer").names())
             )
-        if kind not in SCORER_TYPES:
+        resolved = ComponentResolver().resolve(
+            ComponentSpec.parse("scorer", payload), trusted=True
+        )
+        stage = resolved.instance
+        if not isinstance(stage, cls) and cls is not Scorer:
             raise ValidationError(
-                f"unknown scorer type {kind!r}; accepted types: "
-                + ", ".join(sorted(SCORER_TYPES))
+                f"spec type {resolved.component.name!r} resolves to {type(stage).__name__}, "
+                f"which is not a {cls.__name__}"
             )
-        target = SCORER_TYPES[kind]
-        if not issubclass(target, cls) and cls is not Scorer:
-            raise ValidationError(
-                f"spec type {kind!r} resolves to {target.__name__}, which is not a "
-                f"{cls.__name__}"
-            )
-        return target._build_from_kwargs(payload)
+        return stage
 
     @classmethod
     def _build_from_kwargs(cls, kwargs: Mapping[str, Any]) -> "Scorer":
-        """Construct with ``kwargs``, rejecting anything ``__init__`` cannot take."""
-        accepted = _constructor_keys(cls)
+        """Construct ``cls`` with ``kwargs``, rejecting anything ``__init__`` cannot take."""
+        from ..components.reflect import reflect
+
+        accepted = reflect(cls).keys
         unknown = sorted(set(kwargs) - accepted)
         if unknown:
             raise ValidationError(
@@ -308,24 +305,11 @@ def severity_fraction(
 
 
 def _constructor_keys(cls: type) -> frozenset[str]:
-    """The keyword names ``cls.__init__`` accepts, resolved through the MRO.
+    """The keyword names ``cls.__init__`` accepts. Deprecated alias of ``reflect(cls).keys``.
 
-    Inspected rather than declared so a subclass adding a parameter to its own
-    ``__init__`` is immediately spec-addressable, and a typo can never be
-    swallowed by ``**kwargs`` (none of the stages accept one, deliberately).
+    ``mactf.components.reflect`` implements the same MRO walk (document 17 section 3.3);
+    this stays for callers that imported the private name.
     """
-    accepted: set[str] = set()
-    for klass in cls.__mro__:
-        init = klass.__dict__.get("__init__")
-        if init is None or init is object.__init__:
-            continue
-        for name, parameter in signature(init).parameters.items():
-            if name == "self":
-                continue
-            if parameter.kind in (Parameter.VAR_KEYWORD, Parameter.VAR_POSITIONAL):
-                # ``**kwargs`` would accept anything; treat it as accepting
-                # nothing so validation stays strict instead of vacuous.
-                continue
-            accepted.add(name)
-        break
-    return frozenset(accepted)
+    from ..components.reflect import reflect
+
+    return frozenset(reflect(cls).keys)

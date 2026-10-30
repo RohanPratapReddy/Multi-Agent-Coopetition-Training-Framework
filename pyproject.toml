@@ -131,6 +131,10 @@ mactf = ["py.typed"]
     "peers/*.tpl",
 ]
 "mactf.templates.conf" = ["*.tpl"]
+"mactf.contrib.components.examples" = [
+    "conf/*.yaml",
+    "plans/*.yaml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

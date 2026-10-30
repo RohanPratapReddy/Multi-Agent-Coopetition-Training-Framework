@@ -6,7 +6,8 @@ the loop end" into a registry status and an exit code. A command supplies a ``Ru
 (what to run) and gets a ``DriveResult`` (how it ended); it never touches the lock or the
 signal handlers itself.
 
-Importing this module imports no torch: the orchestrator is imported inside ``execute``.
+Importing this module imports no torch: the engine (``Orchestrator`` or ``TrainerEngine``, chosen by
+``ORCHESTRATOR.ENGINE``) is imported inside ``execute``.
 """
 
 from __future__ import annotations
@@ -172,18 +173,18 @@ class RunDriver:
                 log_path: Path | str | None = None, log_enabled: bool = True,
                 after: Callable[[Any], Mapping[str, Any] | None] | None = None,
                 label: str = "run") -> DriveResult:
-        from ..orchestration.orchestrator import Orchestrator
+        from ..orchestration.dispatch import engine_factory
         from ..orchestration.runlock import RunLock, lock_directory
         from .interrupt import StopFlag
 
         lock = RunLock(lock_directory(self.settings), plan.run_id, owner="cli")
         with lock, StopFlag(timeout=timeout, announce=self.out.warn) as stop:
-            orchestrator = Orchestrator(self.settings)
-            self._recheck(plan, orchestrator.registry)
-            orchestrator.prepare(plan.config)           # raises before any row is written
+            engine = engine_factory(self.settings)      # ORCHESTRATOR.ENGINE decides (document 17 section 13)
+            self._recheck(plan, engine.registry)
+            engine.prepare(plan.config)           # raises before any row is written
             logger, log_file = self._open_log(plan, log_path, log_enabled)
             try:
-                return self._drive(plan, orchestrator, lock, stop, logger, log_file,
+                return self._drive(plan, engine, lock, stop, logger, log_file,
                                    on_interrupt, after, label)
             finally:
                 if logger is not None:
@@ -221,15 +222,15 @@ class RunDriver:
                              message=message, fields=fields))
 
     # -- the loop ----------------------------------------------------------------------
-    def _drive(self, plan, orchestrator, lock, stop, logger, log_file, on_interrupt, after, label):
+    def _drive(self, plan, engine, lock, stop, logger, log_file, on_interrupt, after, label):
         out = self.out
         run_id = plan.run_id
-        registry = orchestrator.registry
-        runtime = orchestrator.context.runtime.describe()
-        peers = list(orchestrator.peers)
-        sandbox = orchestrator.sandbox_choice.describe() if orchestrator.sandbox_choice else "none"
+        registry = engine.registry
+        runtime = engine.context.runtime.describe()
+        peers = list(engine.peers)
+        sandbox = engine.sandbox_choice.describe() if engine.sandbox_choice else "none"
         epochs = plan.epochs
-        notes = list(orchestrator.startup_notes)
+        notes = list(engine.startup_notes)
         self._shown_notes = notes
 
         out.event({"event": "start", "run_id": run_id, "mode": plan.mode, "epochs": epochs,
@@ -272,7 +273,7 @@ class RunDriver:
             return stop.is_set() or lock.lost
 
         try:
-            summary = orchestrator.run(plan.config, should_stop=should_stop, on_epoch=on_epoch)
+            summary = engine.run(plan.config, should_stop=should_stop, on_epoch=on_epoch)
         except KeyboardInterrupt:
             # The second Ctrl-C. Orchestrator.run already wrote the row "failed"; the run is not
             # failed, its last epoch is on disk, so say so.
@@ -287,11 +288,11 @@ class RunDriver:
             out.error(f"training failed: {error}")
             return DriveResult(run_id, "failed", int(ExitCode.FAILURE), {}, log_file=log_file, error=error)
 
-        return self._settle(plan, orchestrator, summary, lock, stop, logger, log_file,
+        return self._settle(plan, engine, summary, lock, stop, logger, log_file,
                             on_interrupt, after, began)
 
-    def _settle(self, plan, orchestrator, summary, lock, stop, logger, log_file, on_interrupt, after, began):
-        registry = orchestrator.registry
+    def _settle(self, plan, engine, summary, lock, stop, logger, log_file, on_interrupt, after, began):
+        registry = engine.registry
         run_id = plan.run_id
         status = str(summary["status"])
         history = summary.get("history") or []
@@ -329,7 +330,7 @@ class RunDriver:
         result = DriveResult(run_id, status, exit_code, summary, stopped_by=stopped_by, log_file=log_file,
                              shown_notes=list(self._shown_notes))
         if after is not None and status in ("completed", "dry_run"):
-            result.extra = dict(after(orchestrator) or {})
+            result.extra = dict(after(engine) or {})
         return result
 
 

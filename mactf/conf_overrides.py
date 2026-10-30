@@ -117,10 +117,59 @@ class _Missing:
 _MISSING = _Missing()
 
 
-def _is_open(defaults: Mapping[str, Any], container_path: Sequence[str]) -> bool:
+def is_open_container(defaults: Mapping[str, Any], container_path: Sequence[str]) -> bool:
     """A container accepts new keys when its default is absent or an empty mapping."""
     default = _default_at(defaults, container_path)
     return default is _MISSING or (isinstance(default, Mapping) and not default)
+
+
+_is_open = is_open_container   # the private name the rest of this module already uses
+
+#: The leaf names of a component spec (section 5.1). ``name`` is accepted by
+#: ``spec_shape_problem`` but is not promoted: a spec is named by ``type`` or ``import``.
+_SPEC_LEAVES = frozenset({"type", "import", "params"})
+
+
+_TRAINER_SPEC_KEYS = frozenset({"PEER_STRATEGY", "WEIGHT_UPDATE", "POLICY", "AGGREGATOR"})
+_TRAINER_TABLE_KEYS = frozenset({"PEER_STRATEGY_OVERRIDES", "WEIGHT_UPDATE_OVERRIDES"})
+
+
+def is_spec_slot(path: Sequence[str]) -> bool:
+    """Whether ``path`` addresses a value that is a component spec (a name or a mapping).
+
+    ``TRAINER.WEIGHT_UPDATE``, ``TRAINER.PEER_STRATEGY_OVERRIDES.<glob>``, ``RL.LOSS``,
+    ``RL.OVERRIDES.LOSS.<glob>`` and ``SCORING.STAGES.<kind>``.
+    """
+    head = [str(part) for part in path]
+    if len(head) >= 2 and head[0] == "TRAINER":
+        if len(head) == 2:
+            return head[1] in _TRAINER_SPEC_KEYS
+        return len(head) == 3 and head[1] in _TRAINER_TABLE_KEYS
+    if head and head[0] == "RL":
+        from .components.kinds import RL_FAMILIES
+
+        families = {name.upper() for name in RL_FAMILIES}
+        if len(head) == 2:
+            return head[1].upper() in families
+        return len(head) == 4 and head[1] == "OVERRIDES" and head[2].upper() in families
+    return len(head) == 3 and head[:2] == ["SCORING", "STAGES"]
+
+
+def _promotion(remaining: Sequence[str]) -> dict[str, Any] | None:
+    """The mapping a scalar becomes so the remaining path can be written, or ``None``.
+
+    ``("params", "temperature")`` -> ``{"params": {}}``
+    ``("type",)``                -> ``{}``
+    anything else                -> ``None`` (refused by the caller, as today)
+    """
+    if not remaining:
+        return None
+    head = remaining[0].lower()
+    if head == "params" and len(remaining) > 1:     # ``params`` as the leaf is a mapping write
+        return {"params": {}}
+    if len(remaining) == 1 and head in {"type", "import"}:
+        return {}
+    return None
 
 
 def apply_overrides(
@@ -138,7 +187,9 @@ def apply_overrides(
             )
         container: Any = values
         walked: list[str] = []
-        for segment in path[:-1]:
+        promoted_last = False           # the final container was a scalar spec placeholder
+        for index, segment in enumerate(path[:-1]):
+            promoted_last = False
             if not isinstance(container, dict):
                 raise CommandError.usage(
                     f"--set {override.text!r}: {'.'.join(walked)} is not a mapping"
@@ -159,16 +210,28 @@ def apply_overrides(
                     f"set the whole list: --set '{'.'.join(walked)}=[...]'"
                 )
             if not isinstance(child, dict):
-                raise CommandError.usage(
-                    f"--set {override.text!r}: {'.'.join(walked)} is a {_type_name(child)}, not a mapping"
-                )
+                promoted = _promotion(path[index + 1 :])
+                if promoted is None or not isinstance(child, (str, type(None))):
+                    # A scalar is only a *spec* placeholder; a float or a bool is a leaf,
+                    # and walking into it cannot mean anything.
+                    raise CommandError.usage(
+                        f"--set {override.text!r}: {'.'.join(walked)} is a "
+                        f"{_type_name(child)}, not a mapping"
+                    )
+                if "params" in promoted and isinstance(child, str) and child:
+                    # The name survives: ``--set X.params.k=v`` over ``X: uniform`` is
+                    # ``{type: uniform, params: {k: v}}``, never a spec with no name.
+                    promoted = {"type": child, **promoted}
+                container[segment] = promoted
+                child = promoted
+                promoted_last = True
             container = child
         last = path[-1]
         if len(path) == 1:
             old = container[last]
         elif last in container:
             old = container[last]
-        elif _is_open(defaults, walked):
+        elif promoted_last or _is_open(defaults, walked):
             old = None
             container[last] = None
         else:
@@ -176,7 +239,8 @@ def apply_overrides(
                 f"{'.'.join(walked)} has no key {last!r} in --set {override.text!r}"
                 f"{_suggest(last, list(container))}"
             )
-        if not _compatible(old, override.value):
+        spec_slot = is_spec_slot(path) and isinstance(old, (str, dict, type(None)))
+        if not (spec_slot and isinstance(override.value, (str, dict))) and not _compatible(old, override.value):
             raise CommandError.usage(
                 f"--set {override.text!r}: {'.'.join(path)} is a {_type_name(old)} "
                 f"({old!r}); {override.value!r} is a {_type_name(override.value)}"

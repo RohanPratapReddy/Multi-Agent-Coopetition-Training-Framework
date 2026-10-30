@@ -43,6 +43,7 @@ __all__ = [
     "ScoreTrendProbe",
     "StaleProgressProbe",
     "ThroughputProbe",
+    "TreeGrowthProbe",
     "WarningSpikeProbe",
     "WatchdogAction",
     "WatchdogPolicy",
@@ -300,6 +301,17 @@ class HealthContext:
     now: float | None = None
     monotonic: float | None = None
     extras: Mapping[str, Any] = field(default_factory=dict)
+    #: First index of ``losses`` measured on the current topology. ``LossTrendProbe`` judges only
+    #: ``losses[loss_baseline:]``; the NaN and Inf probes still read all of ``losses`` (12.8.2).
+    loss_baseline: int = 0
+    #: Peers that are retired (still in the tree, out of play). ``tree_nodes`` counts only the others.
+    retired_nodes: int = 0
+    #: How many plans have committed, and the topology epoch they reached. Both 0 for a run that never mutated.
+    mutations: int = 0
+    topology_epoch: int = 0
+    #: ``pruner(path, dead_epochs) -> nodes removed``. Set by a trainer; ``None`` for a context a
+    #: caller built by hand, in which case ``prune_branch`` falls back to ``extras["tree"]``.
+    pruner: Callable[[str, int], int] | None = None
 
     def copies(self, **changes: Any) -> "HealthContext":
         payload = dict(self.__dict__)
@@ -390,7 +402,7 @@ class LossTrendProbe(_BaseProbe):
     name = "loss_trend"
 
     def probe(self, context: HealthContext) -> ProbeResult:
-        losses = [float(value) for value in context.losses]
+        losses = [float(value) for value in context.losses][max(0, int(context.loss_baseline)):]
         if len(losses) < 2:
             return self._healthy()
         history = losses[:-1]
@@ -748,6 +760,46 @@ class DepthCostProbe(_BaseProbe):
         return self._healthy()
 
 
+class TreeGrowthProbe(_BaseProbe):
+    """The active tree is more than ``max_tree_growth_ratio`` times the tree the run was built with.
+
+    The probe is advisory (``DEGRADED`` at most): a user who doubles a tree on purpose raises
+    ``WATCHDOG.MAX_TREE_GROWTH_RATIO``, and ``W044`` says so when the schedule is validated.
+    Its job is the callback or strategy that requests a peer every epoch by mistake;
+    ``TRAINER.MUTATION.MAX_PLANS_PER_EPOCH`` bounds the rate, this bounds the total.
+    """
+
+    name = "tree_growth"
+
+    def probe(self, context: HealthContext) -> ProbeResult:
+        nodes = context.tree_nodes
+        initial = context.initial_tree_nodes
+        if not nodes or not initial or int(initial) <= 0:
+            return self._healthy()
+        ratio = float(nodes) / float(initial)
+        limit = float(self.policy.max_tree_growth_ratio)
+        metadata = {
+            "nodes": int(nodes),
+            "initial_nodes": int(initial),
+            "retired": int(context.retired_nodes),
+            "mutations": int(context.mutations),
+            "topology_epoch": int(context.topology_epoch),
+        }
+        if ratio > limit:
+            return ProbeResult(
+                name=self.name,
+                status=WatchdogStatus.DEGRADED,
+                value=ratio,
+                threshold=limit,
+                detail=(
+                    f"the tree has {int(nodes)} active nodes, {ratio:.2f}x the {int(initial)} it was "
+                    f"built with, after {int(context.mutations)} mutation(s)"
+                ),
+                metadata=metadata,
+            )
+        return self._healthy(ratio, threshold=limit, metadata=metadata)
+
+
 def default_probes(policy: WatchdogPolicy) -> list[HealthProbe]:
     """The documented probe set, in report order."""
     return [
@@ -767,6 +819,7 @@ def default_probes(policy: WatchdogPolicy) -> list[HealthProbe]:
         DeadBranchProbe(policy),
         ChildStarvationProbe(policy),
         DepthCostProbe(policy),
+        TreeGrowthProbe(policy),
     ]
 
 
@@ -1015,10 +1068,20 @@ class MACTFWatchdog:
                     "an epoch is running unusually long: inspect the slowest node's "
                     "module and the sandbox provider"
                 )
+            elif result.name == "dead_branch" and result.metadata.get("pruned"):
+                advice.append(
+                    f"branch {result.node_path!r} was removed from play ({result.metadata['pruned']}); "
+                    "its weights are in the checkpoint written before the prune"
+                )
             elif result.name == "dead_branch":
                 advice.append(
                     f"branch {result.node_path!r} produced nothing: check that node's "
                     "module and its delegation policy"
+                )
+            elif result.name == "tree_growth":
+                advice.append(
+                    "the tree keeps growing: inspect the callbacks and strategies that call "
+                    "request_mutation, or raise WATCHDOG.MAX_TREE_GROWTH_RATIO if the growth is intended"
                 )
             elif result.name == "child_starvation":
                 advice.append(
@@ -1126,17 +1189,30 @@ class MACTFWatchdog:
         return result
 
     def prune_branch(self, context: HealthContext) -> int:
-        """Drop every dead subtree the report named, then snapshot again."""
+        """Drop every dead subtree the report named; returns how many nodes left play.
+
+        A trainer sets ``context.pruner``, which turns the removal into a mutation plan (12.8.5):
+        the tree, the peers, the optimizers, the controllers and every per-path cache change
+        together or not at all. A context a caller built by hand carries only a tree, and the
+        original ``remove_node`` is the best that can be done for a structure nothing else
+        depends on.
+        """
         removed = 0
+        pruner = context.pruner
         tree = context.extras.get("tree")
-        if tree is None:
+        if pruner is None and tree is None:
             return 0
         for path, count in sorted(context.dead_branches.items()):
             if int(count) < self.policy.dead_branch_patience:
                 continue
             try:
-                removed += int(tree.remove_node(str(path), recursive=True))
-            except Exception as error:  # noqa: BLE001
+                if pruner is not None:
+                    removed += int(pruner(str(path), int(count)))
+                else:
+                    removed += int(tree.remove_node(str(path), recursive=True))
+            except Exception as error:  # noqa: BLE001 - a failed prune is reported, never fatal
+                if getattr(error, "code", None) == "E089" and getattr(error, "rolled_back", True) is False:
+                    raise           # the engine could not undo a failed commit: the run must stop (R9)
                 emit = getattr(self.logger, "error", None)
                 if callable(emit):
                     emit(f"watchdog could not prune branch {path!r}: {error}")

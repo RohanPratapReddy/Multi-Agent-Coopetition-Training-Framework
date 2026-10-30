@@ -8,6 +8,7 @@ typo in a submitted spec is an error and not a silently ignored key.
 from __future__ import annotations
 
 import copy
+import re
 from typing import Any
 
 from ...conf import _deep_merge
@@ -19,10 +20,14 @@ from ...distill.config import (
 )
 from ...exceptions import ImproperlyConfigured, ValidationError
 from ...http.serializers import (
+    BoolField,
     CharField,
+    ChoiceField,
+    DictField,
     Field,
     FieldError,
     ListField,
+    NestedField,
     ModelSerializer,
     RawField,
     Serializer,
@@ -30,6 +35,149 @@ from ...http.serializers import (
 from ...scoring.scorecard import EpisodeScorecard, PeerScorecard
 
 _SEVERITIES = ["S0", "S1", "S2", "S3", "S4"]
+
+
+# ---------------------------------------------------------------------------
+# Component choices read from the live registry (document 17 section 16.3.2)
+def _registry_names(kind_id: str) -> list[str]:
+    from ...components import HUB
+
+    return list(HUB.registry(kind_id).names())
+
+
+class ComponentChoiceField(ChoiceField):
+    """A ``ChoiceField`` whose choices are the registry's names *now*, not at import.
+
+    ``Serializer`` resolves its declared fields once per class, so a plain ``ChoiceField``
+    would freeze whatever was registered when the module was imported. ``Serializer.__init__``
+    calls :meth:`refresh` on every instance, which is once per request.
+    """
+
+    def __init__(self, kind_id: str, **options: Any) -> None:
+        self.kind_id = kind_id
+        super().__init__(choices=self._names(), **options)
+
+    def _names(self) -> list[str]:
+        return _registry_names(self.kind_id)
+
+    def refresh(self) -> None:
+        self.choices = self._names()
+
+    def schema(self) -> dict[str, Any]:
+        self.refresh()
+        return super().schema()
+
+
+class ComponentKindField(ChoiceField):
+    """A component kind id (``scorer``, ``rl_function.loss``, ...), refreshed per request."""
+
+    def __init__(self, **options: Any) -> None:
+        super().__init__(choices=self._names(), **options)
+
+    @staticmethod
+    def _names() -> list[str]:
+        from ...components import all_kind_ids
+
+        return sorted(all_kind_ids())
+
+    def refresh(self) -> None:
+        self.choices = self._names()
+
+
+#: Keys of a component spec mapping (section 5.1) and of the two legacy spellings the
+#: wrapper-layer specs always accepted (``frozen`` for a strategy, ``weights`` for ``explicit``).
+_SPEC_KEYS = ("type", "import", "params")
+_LEGACY_KEYS = {"peer_strategy": ("frozen",), "weight_update": ("weights",)}
+
+
+class ComponentSpecField(Field):
+    """A component spec: a registered name, or ``{type | import, params}`` (section 5.1).
+
+    ``kind_id`` names the registry. ``names`` makes the field check ``type`` against the live
+    registry (the trainer-spec form); without it the resolver decides later and an unknown name
+    is a ``404`` rather than a ``422``. ``require_target`` is false for a *patch*, which carries
+    only ``params``. A string is accepted when ``allow_name`` is true.
+    """
+
+    json_type = None
+
+    def __init__(
+        self, kind_id: str | None = None, *, names: bool = False, allow_name: bool = True,
+        require_target: bool = False, **options: Any,
+    ) -> None:
+        super().__init__(**options)
+        self.kind_id = kind_id
+        self.names = bool(names and kind_id)
+        self.allow_name = allow_name
+        self.require_target = require_target
+
+    def _known(self) -> list[str]:
+        return _registry_names(self.kind_id) if self.kind_id else []
+
+    def _name_problem(self, name: str) -> str | None:
+        if not self.names:
+            return None
+        known = self._known()
+        lowered = name.lower() if self.kind_id in ("peer_strategy", "weight_update") else name
+        if lowered in known:
+            return None
+        return f"{name!r} is not a registered {self.kind_id}; expected one of {known}."
+
+    def to_internal(self, value: Any) -> Any:
+        if isinstance(value, str):
+            if not self.allow_name:
+                raise FieldError("a spec must be a mapping with 'type' or 'import'.")
+            problem = self._name_problem(value)
+            if problem:
+                raise FieldError(problem)
+            return value
+        if not isinstance(value, dict):
+            raise FieldError("a spec is a name or a mapping.")
+        allowed = set(_SPEC_KEYS) | {"name"} | set(_LEGACY_KEYS.get(self.kind_id or "", ()))
+        unknown = sorted(set(value) - allowed)
+        if unknown and self.names:
+            raise FieldError(f"unknown spec key(s) {unknown}; allowed: {sorted(allowed)}.")
+        for key in ("type", "import"):
+            if value.get(key) is not None and not isinstance(value[key], str):
+                raise FieldError({key: ["must be a string."]})
+        if value.get("params") is not None and not isinstance(value["params"], dict):
+            raise FieldError({"params": ["must be a mapping."]})
+        if value.get("type") and value.get("import"):
+            raise FieldError("give 'type' or 'import', not both.")
+        if self.require_target and not (value.get("type") or value.get("import")):
+            raise FieldError("a spec needs 'type' or 'import'.")
+        if value.get("type"):
+            problem = self._name_problem(str(value["type"]))
+            if problem:
+                raise FieldError({"type": [problem]})
+        if value.get("import") and not re.match(r"^[\w.]+:[\w.]+$", str(value["import"])):
+            raise FieldError({"import": ["must look like 'pkg.mod:Name'."]})
+        return {k: v for k, v in value.items() if v is not None}
+
+    def schema(self) -> dict[str, Any]:
+        mapping: dict[str, Any] = {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string"},
+                "import": {"type": "string", "pattern": r"^[\w.]+:[\w.]+$"},
+                "params": {"type": "object"},
+            },
+        }
+        if self.names and self.kind_id:
+            mapping["properties"]["type"]["enum"] = self._known()
+        out: dict[str, Any]
+        if self.allow_name:
+            name: dict[str, Any] = {"type": "string"}
+            if self.names:
+                name["enum"] = self._known()
+            out = {"oneOf": [name, mapping]}
+        else:
+            out = mapping
+        if self.help_text:
+            out["description"] = self.help_text
+        if self.allow_null:
+            out["nullable"] = True
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -541,8 +689,14 @@ class TrainerSpecSerializer(Serializer):
     loss: LossSpecSerializer | None = Field(allow_null=True, default=None)
     finetuning: FinetuneSpecSerializer | None = Field(allow_null=True, default=None)
     scorers: ScorerChainSpecSerializer | None = Field(allow_null=True, default=None)
-    peer_strategy: PeerStrategySpecSerializer | None = Field(allow_null=True, default=None)
-    weight_update: WeightUpdateSpecSerializer | None = Field(allow_null=True, default=None)
+    peer_strategy = ComponentSpecField(
+        "peer_strategy", names=True, allow_null=True, default=None,
+        help_text="A registered strategy name, or {type | import, params}.",
+    )
+    weight_update = ComponentSpecField(
+        "weight_update", names=True, allow_null=True, default=None,
+        help_text="A registered weight-update name, or {type | import, params}.",
+    )
     grad_accumulation: int = Field(default=1, min_value=1)
     max_grad_norm: float | None = Field(allow_null=True, default=None, min_value=0.0)
     steps_per_epoch: int | None = Field(allow_null=True, default=None, min_value=1)
@@ -625,7 +779,10 @@ class InferenceResultSerializer(Serializer):
 class LogRecordSerializer(Serializer):
     unknown_fields = "allow"
     kind: str = Field(
-        choices=["epoch", "step", "loss", "score", "aggregation", "warning", "checkpoint", "health", "resume", "log"]
+        choices=[
+            "epoch", "step", "loss", "score", "aggregation", "warning", "checkpoint", "health", "resume", "log",
+            "mutation",
+        ]
     )
     run_id: str = Field()
     node_path: str = Field(default="")
@@ -824,3 +981,43 @@ class PaginationSerializer(Serializer):
     unknown_fields = "allow"
     limit: int = Field(default=50, min_value=1, max_value=500)
     offset: int = Field(default=0, min_value=0)
+
+
+# ---------------------------------------------------------------------------
+# Components and mutations (document 17 section 16.3)
+class ComponentSpecSerializer(Serializer):
+    """One spec in the uniform shape of section 5.1 (documentation of the nested field)."""
+
+    unknown_fields = "forbid"
+    type: str | None = Field(allow_null=True, default=None, max_length=128, pattern=r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+    params: dict = Field(default_factory=dict)
+
+
+# ``import`` is a keyword, so the field cannot be an annotated attribute.
+ComponentSpecSerializer.import_path = CharField(  # type: ignore[attr-defined]
+    required=False, allow_null=True, max_length=256, pattern=r"^[\w.]+:[\w.]+$"
+)
+setattr(ComponentSpecSerializer, "import", ComponentSpecSerializer.__dict__["import_path"])
+del ComponentSpecSerializer.import_path
+
+
+class ComponentValidateSerializer(Serializer):
+    unknown_fields = "forbid"
+    kind = ComponentKindField()
+    spec = ComponentSpecField(allow_name=False, help_text="{type | import, params}.")
+    probe = BoolField(default=False, help_text="Build a throwaway instance; refused for a spec carrying an import.")
+
+
+class ComponentPatchSerializer(Serializer):
+    unknown_fields = "forbid"
+    slot = CharField(max_length=128, help_text="A slot path such as TRAINER.WEIGHT_UPDATE or RL.loss.")
+    spec = ComponentSpecField(allow_name=True, help_text="A spec, or a patch carrying only params.")
+    boundary = ChoiceField(choices=["episode", "step"], default="episode")
+
+
+class MutationSerializer(Serializer):
+    unknown_fields = "forbid"
+    plan: list[dict] = Field(min_length=1, max_length=256)
+    dry_run: bool = Field(default=False)
+    label: str | None = Field(allow_null=True, default=None, max_length=64)
+    reason: str | None = Field(allow_null=True, default=None, max_length=256)

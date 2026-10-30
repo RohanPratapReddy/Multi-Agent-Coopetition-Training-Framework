@@ -1,0 +1,5 @@
+# 18.1: a reward stage that tempers credit. conf/components.yaml + conf/scorer.yaml.
+COMPONENTS: {MODULES: ["mactf.contrib.components.examples.tempered_reward"]}
+SCORING:
+  STAGES:
+    reward: {type: tempered_reward, params: {factor: 0.5}}

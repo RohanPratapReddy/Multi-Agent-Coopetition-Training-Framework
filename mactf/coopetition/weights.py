@@ -19,19 +19,26 @@ from typing import Any, ClassVar, Mapping, Protocol, Sequence, runtime_checkable
 
 import torch
 
+from ..components.legacy import LegacyTable
 from ..exceptions import ComplianceError, ValidationError
 from .aggregation import AggregationReport, Aggregator
 
 __all__ = [
+    "BUILTIN_WEIGHT_TYPES",
     "ExplicitWeightStrategy",
+    "GroupView",
     "KappaSoftmaxAverage",
     "NoAggregation",
     "ReferenceOnlyAverage",
     "ScoreWeightedAverage",
     "UniformAverage",
     "WEIGHT_STRATEGIES",
+    "WeightStrategy",
+    "WeightTraits",
     "WeightUpdateStrategy",
     "build_weight_update",
+    "make_report",
+    "traits_of",
 ]
 
 
@@ -56,6 +63,116 @@ class WeightUpdateStrategy(Protocol):
 
     @classmethod
     def from_spec(cls, spec: "Mapping[str, Any] | str") -> "WeightUpdateStrategy": ...
+
+
+@dataclass(frozen=True)
+class WeightTraits:
+    """What a strategy promises about its output. Read by ``WeightGuard``."""
+
+    #: ``False`` for a strategy that deliberately writes nothing (``NoAggregation``).
+    #: The guard skips it entirely.
+    aggregates: bool = True
+    #: ``True`` when ``report.fallback = True`` is the *intended* outcome: a reset to the
+    #: reference peer. ``Aggregator.aggregate`` then copies the reference parameters and
+    #: the weights are informational. Without this declaration a fallback report is read as
+    #: the strategy failing, which is the rule the trainer has always applied (W-G5).
+    may_fallback: bool = False
+
+
+def traits_of(strategy: Any) -> WeightTraits:
+    """The declared traits of ``strategy``; the default (aggregates, no reset) otherwise."""
+    found = getattr(strategy, "traits", None)
+    return found if isinstance(found, WeightTraits) else WeightTraits()
+
+
+@dataclass(frozen=True)
+class GroupView:
+    """One aggregation group, as a strategy's optional ``validate`` sees it."""
+
+    label: str                       # "root", or the parent node's path
+    parent: str | None
+    members: tuple[str, ...]
+    level: int                       # 0 for the root group, the parent's depth otherwise
+    floor: float
+    cap: float
+
+
+class WeightStrategy:
+    """Optional base class for custom strategies.
+
+    It supplies ``describe`` and ``from_spec`` so that a subclass has to write ``apply``
+    and nothing else. A subclass may also define:
+
+    * ``validate(group: GroupView) -> Sequence[str]``: problems with serving ``group``
+      (``E064`` at build, and again after a tree mutation);
+    * ``state_dict() -> dict`` / ``load_state_dict(payload) -> None``: JSON-serializable
+      state carried across a resume;
+    * ``clone() -> WeightStrategy``: only for an in-code *instance* that must not be shared
+      between groups (a strategy built from a spec is built once per group anyway);
+    * ``traits``: a ``WeightTraits``.
+    """
+
+    name: ClassVar[str] = ""
+    traits: ClassVar[WeightTraits] = WeightTraits()
+
+    def apply(
+        self,
+        vectors: Mapping[str, torch.Tensor],
+        scores: Mapping[str, float],
+        *,
+        kappa: float,
+        level: int = 0,
+        eligible: Mapping[str, bool] | None = None,
+        confidence: Mapping[str, float] | None = None,
+    ) -> AggregationReport:
+        raise NotImplementedError(f"{type(self).__name__} must implement apply()")
+
+    def describe(self) -> dict[str, Any]:
+        return {"name": self.name or type(self).__name__, "class": type(self).__name__}
+
+    @classmethod
+    def from_spec(cls, spec: Any) -> "WeightStrategy":
+        if isinstance(spec, Mapping):
+            return cls(**{k: v for k, v in spec.items() if k not in ("type", "name")})
+        return cls()
+
+
+def make_report(
+    weights: Mapping[str, float],
+    names: Sequence[str],
+    *,
+    kappa: float,
+    eligible: Mapping[str, bool] | None = None,
+    raw: Mapping[str, float] | None = None,
+    adjustments: Sequence[str] = (),
+    trimmed: Sequence[str] = (),
+    fallback: bool = False,
+    entropy: float | None = None,
+) -> AggregationReport:
+    """Build an ``AggregationReport`` for ``names`` from partial ``weights``.
+
+    Peers absent from ``weights`` get 0. ``gated_peers`` is derived from ``eligible`` so a
+    custom strategy cannot forget to list the peers it zeroed. ``entropy`` defaults to the
+    Shannon entropy (nats) of the positive weights.
+    """
+    ordered = _ordered(names)
+    full = {name: float(weights.get(name, 0.0)) for name in ordered}
+    source = raw if raw is not None else weights
+    gated = tuple(
+        name for name in ordered if eligible is not None and not bool(eligible.get(name, True))
+    )
+    measured = entropy if entropy is not None else _entropy([v for v in full.values() if v > 0.0])
+    return AggregationReport(
+        weights=full,
+        raw_weights={name: float(source.get(name, 0.0)) for name in ordered},
+        kappa=float(kappa),
+        entropy=float(measured),
+        adjustments=list(adjustments),
+        fallback=bool(fallback),
+        gated_peers=gated,
+        trimmed_peers=tuple(trimmed),
+        order=tuple(ordered),
+    )
 
 
 def _ordered(names: Sequence[str]) -> list[str]:
@@ -460,64 +577,91 @@ def _entropy(values: Sequence[float]) -> float:
     return float(total)
 
 
-#: Every strategy addressable by name, in the order the plan lists them.
-WEIGHT_STRATEGIES: dict[str, type] = {
-    "kappa_softmax": KappaSoftmaxAverage,
-    "uniform": UniformAverage,
-    "score_weighted": ScoreWeightedAverage,
-    "reference_only": ReferenceOnlyAverage,
-    "none": NoAggregation,
-    "explicit": ExplicitWeightStrategy,
-}
+# Declared after the class bodies, so the built-ins need no edit beyond one line each.
+NoAggregation.traits = WeightTraits(aggregates=False)
+ReferenceOnlyAverage.traits = WeightTraits(may_fallback=True)
+# ``Aggregator.compute_weights`` flags ``fallback`` by design (no eligible peer, or the
+# disagreement check): the trainer has always accepted that from the default strategy, so a
+# guard that covers it (a subclassed aggregator) must too.
+KappaSoftmaxAverage.traits = WeightTraits(may_fallback=True)
+
+#: Every strategy addressable by name, in the order the plan lists them. A view of
+#: ``HUB.registry("weight_update")``: writes route through the registry, so
+#: ``register_weight_update`` and a legacy ``WEIGHT_STRATEGIES["mine"] = Mine`` are the same act.
+WEIGHT_STRATEGIES: dict[str, type] = LegacyTable(
+    "weight_update",
+    {
+        "kappa_softmax": KappaSoftmaxAverage,
+        "uniform": UniformAverage,
+        "score_weighted": ScoreWeightedAverage,
+        "reference_only": ReferenceOnlyAverage,
+        "none": NoAggregation,
+        "explicit": ExplicitWeightStrategy,
+    },
+)
+
+#: The framework's own classes: what ``WeightGuard`` leaves alone under ``SCOPE: custom``.
+BUILTIN_WEIGHT_TYPES: frozenset[type] = frozenset(dict.values(WEIGHT_STRATEGIES))
+
+
+def _split_spec(
+    spec: Any, aggregator: Aggregator | None
+) -> tuple[Any, dict[str, Any]]:
+    """The raw spec the resolver wants, plus what the framework injects.
+
+    ``aggregator`` is *injected*, never a spec key: a built-in that wants one declares an
+    ``aggregator`` parameter and receives it, and a custom class that declares none does not.
+    The legacy form ``{"type": "kappa_softmax", "aggregator": <Aggregator>}`` is still read.
+    """
+    inject: dict[str, Any] = {"aggregator": aggregator} if aggregator is not None else {}
+    if isinstance(spec, str):
+        return spec.strip().lower(), inject
+    if isinstance(spec, Mapping):
+        payload = dict(spec)
+        nested = payload.pop("aggregator", None)
+        if isinstance(nested, Aggregator):
+            inject["aggregator"] = nested
+        written = payload.pop("name", None)
+        if "type" not in payload and "import" not in payload:
+            payload["type"] = str(written or "kappa_softmax")
+        if "type" in payload:
+            payload["type"] = str(payload["type"]).strip().lower()
+        return payload, inject
+    return spec, inject          # an already-parsed ComponentSpec
 
 
 def build_weight_update(
     spec: "WeightUpdateStrategy | str | Mapping[str, Any] | None",
     *,
     aggregator: Aggregator | None = None,
+    resolver: Any | None = None,
+    trusted: bool = True,
 ) -> WeightUpdateStrategy:
     """Resolve a strategy from an instance, a name, a spec, or ``None``.
 
-    ``None`` returns ``KappaSoftmaxAverage`` bound to ``aggregator``, which is the
-    documented default. An unknown name raises at construction with the accepted
-    list, never at epoch 4.
+    ``None`` returns ``KappaSoftmaxAverage`` bound to ``aggregator``, the documented default.
+    A name or mapping goes through the component registry, so it may name a built-in, a
+    project component or a plugin, and an unknown name or an unaccepted key raises at
+    construction (``ComponentMissing`` / ``ComponentParamError``, both ``ValidationError``)
+    with the accepted list, never at epoch 4. A mapping may use flat keys
+    (``{"type": "explicit", "weights": {...}}``) or ``params``.
     """
+    from ..components.resolver import ComponentResolver, ComponentSpec
+
     if spec is None:
         return KappaSoftmaxAverage(aggregator)
-    if isinstance(spec, str):
-        key = spec.strip().lower()
-        if key not in WEIGHT_STRATEGIES:
-            raise ValidationError(
-                f"unknown weight_update {spec!r}; accepted: "
-                + ", ".join(sorted(WEIGHT_STRATEGIES))
-            )
-        if key == "kappa_softmax":
-            return KappaSoftmaxAverage(aggregator)
-        return WEIGHT_STRATEGIES[key]()
-    if isinstance(spec, Mapping):
-        payload = dict(spec)
-        key = str(payload.pop("type", payload.pop("name", "kappa_softmax"))).lower()
-        if key not in WEIGHT_STRATEGIES:
-            raise ValidationError(
-                f"unknown weight_update type {key!r}; accepted: "
-                + ", ".join(sorted(WEIGHT_STRATEGIES))
-            )
-        if key == "kappa_softmax":
-            candidate = payload.get("aggregator")
-            return KappaSoftmaxAverage(
-                candidate if isinstance(candidate, Aggregator) else aggregator
-            )
-        if key == "explicit":
-            return ExplicitWeightStrategy.from_spec(payload)
-        target = WEIGHT_STRATEGIES[key]
-        return target.from_spec(payload)
-    if isinstance(spec, (KappaSoftmaxAverage, UniformAverage, ScoreWeightedAverage,
-                         ReferenceOnlyAverage, NoAggregation, ExplicitWeightStrategy)):
-        if isinstance(spec, KappaSoftmaxAverage) and spec.aggregator is None and aggregator:
+    if isinstance(spec, (str, Mapping, ComponentSpec)):
+        raw, inject = _split_spec(spec, aggregator)
+        parsed = ComponentSpec.parse("weight_update", raw)
+        return (resolver or ComponentResolver()).resolve(
+            parsed, trusted=trusted, inject=inject
+        ).instance
+    if isinstance(spec, KappaSoftmaxAverage):
+        if spec.aggregator is None and aggregator is not None:
             return KappaSoftmaxAverage(aggregator)
         return spec
-    if hasattr(spec, "apply") and hasattr(spec, "describe"):
-        return spec  # a structural custom strategy
+    if callable(getattr(spec, "apply", None)) and callable(getattr(spec, "describe", None)):
+        return spec  # an instance: structural, any class
     raise ValidationError(
         f"weight_update must be a strategy, a name, or a mapping; got {type(spec).__name__}"
     )

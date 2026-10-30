@@ -24,8 +24,12 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 import torch
 
+from ..compliance import effective_non_offsettable
+from ..components import HUB
+from ..components.guards.rollup import guard_rollup
 from ..coopetition.tree import PeerNode, PeerTree, branch_void, node_seed
 from ..exceptions import ContractError, ValidationError
+from ..rl.functions.registry import FUNCTION_TYPES, build_function
 from ..rl.functions.rollup import (
     ExplicitRollup,
     KappaWeightedRollup,
@@ -93,40 +97,36 @@ def reset_inference_pipeline() -> None:
     global _INFERENCE_PIPELINE
     _INFERENCE_PIPELINE = None
 
-#: Registry keys used by ``HIERARCHY.ROLLUP`` and by spec resolution.
-ROLLUP_STRATEGIES: dict[str, type] = {
-    "kappa_weighted": KappaWeightedRollup,
-    "kappa": KappaWeightedRollup,
-    "mean": MeanRollup,
-    "sum": SumRollup,
-    "minimum": MinimumRollup,
-    "worst_case": WorstCaseRollup,
-    "explicit": ExplicitRollup,
-}
+#: Registry keys used by ``RL.ROLLUP`` and by spec resolution: the same live object as
+#: ``rl.functions.registry.ROLLUP_TYPES`` (a ``LegacyTable`` over ``rl_function.rollup``), so a
+#: rollup registered anywhere is available everywhere (document 17 section 8.6.1).
+ROLLUP_STRATEGIES = FUNCTION_TYPES["rollup"]
 ROLLUP_TYPES = ROLLUP_STRATEGIES
 
 
-def build_rollup(spec: Any) -> Any:
-    """Resolve a rollup from a strategy, a name, or a spec mapping."""
+def build_rollup(spec: Any, *, guard_mode: str = "enforce") -> Any:
+    """Resolve a rollup from a strategy, a name, or a spec mapping.
+
+    A rollup that is not one of the six built-in classes is wrapped in a ``RollupGuard``
+    (8.6.2). The built-ins are returned as they are, ``ExplicitRollup`` included: an
+    ``ExplicitRollup(fn)`` constructed in code is the documented "I own the whole output"
+    exception (``rl/functions/rollup.py``). The ``RL.ROLLUP`` path is stricter and guards it
+    too (``FunctionBook``, 8.4).
+    """
     if spec is None:
         return KappaWeightedRollup()
     if isinstance(spec, RollupStrategy) or hasattr(spec, "rollup"):
-        return spec
-    if isinstance(spec, str):
-        key = spec
-        payload: dict[str, Any] = {"type": key}
-    else:
-        payload = dict(spec)
-        key = str(payload.get("type", "kappa_weighted"))
-    if key not in ROLLUP_STRATEGIES:
-        raise ValidationError(
-            f"unknown rollup {key!r}; accepted: " + ", ".join(sorted(ROLLUP_STRATEGIES))
-        )
-    if isinstance(spec, str):
-        return ROLLUP_STRATEGIES[key]()
-    from ..rl.functions.registry import build_function
-
-    return build_function(payload, family="rollup")
+        return guard_rollup(spec, mode=guard_mode, include_explicit=False)
+    payload: dict[str, Any] = {"type": spec} if isinstance(spec, str) else dict(spec)
+    if "import" not in payload:
+        payload.setdefault("type", "kappa_weighted")
+        registry = HUB.registry("rl_function.rollup")
+        if not registry.has(str(payload["type"])):
+            raise ValidationError(
+                f"unknown rollup {payload['type']!r}; accepted: " + ", ".join(registry.names())
+            )
+    built = build_function(payload, family="rollup")
+    return guard_rollup(built, mode=guard_mode, include_explicit=False)
 
 
 class HierarchicalScorer(Scorer):
@@ -149,6 +149,7 @@ class HierarchicalScorer(Scorer):
         rollup: Any = None,
         attribution: str = "rollup",
         non_offsettable: Iterable[str] | None = None,
+        rollup_source: Callable[[], Any] | None = None,
     ) -> None:
         super().__init__()
         if pipeline_factory is None:
@@ -163,13 +164,27 @@ class HierarchicalScorer(Scorer):
             raise ValidationError(
                 "HierarchicalScorer needs a ScoringPipeline or a callable returning one"
             )
-        self.rollup: Any = build_rollup(rollup)
+        self._rollup: Any = build_rollup(rollup)
+        self._rollup_source = rollup_source
         if attribution not in ("rollup", "own"):
             raise ValidationError(
                 f"unknown attribution {attribution!r}; use 'rollup' or 'own'"
             )
         self.attribution = attribution
-        self.non_offsettable: frozenset[str] = frozenset(non_offsettable or ())
+        self.non_offsettable: frozenset[str] = effective_non_offsettable(non_offsettable)
+
+    @property
+    def rollup(self) -> Any:
+        """The strategy in force now: the source's choice when it has one, else the default."""
+        if self._rollup_source is not None:
+            chosen = self._rollup_source()
+            if chosen is not None:
+                return chosen
+        return self._rollup
+
+    @rollup.setter
+    def rollup(self, value: Any) -> None:
+        self._rollup = build_rollup(value)
 
     @property
     def points_table(self) -> Any:
@@ -192,9 +207,7 @@ class HierarchicalScorer(Scorer):
         return self._shared or self.pipeline_for("")
 
     def registry_for(self, peer: str, *, node_path: str = "") -> Any:
-        return self.pipeline_for(node_path).warning_scorer.registry_for(
-            peer, node_path=node_path
-        )
+        return self.pipeline_for(node_path).warning_scorer.registry_for_node(node_path, peer)
 
     # -- scoring ---------------------------------------------------------
     def score_tree(
@@ -301,21 +314,21 @@ class HierarchicalScorer(Scorer):
         *,
         non_offsettable: frozenset[str],
     ) -> dict[str, frozenset[str]]:
-        """Each node's own non-offsettable rule ids, from its own ledger only."""
-        catalog_defaults = non_offsettable or None
+        """Each node's own non-offsettable rule ids, from its own ledger only.
+
+        ``non_offsettable`` is the effective superset, so a custom set can add rules but
+        can no longer narrow the catalog default (the old ``catalog_defaults`` branch let a
+        non-empty set do exactly that).
+        """
         result: dict[str, frozenset[str]] = {}
         for node in tree.walk("leaves-first"):
             ledger = ledgers.get(node.path)
             if ledger is None:
                 result[node.path] = frozenset()
                 continue
-            rules = {
-                event.rule_id
-                for event in ledger.events
-                if event.rule.non_offsettable
-                and (catalog_defaults is None or event.rule_id in catalog_defaults)
-            }
-            result[node.path] = frozenset(rules)
+            result[node.path] = frozenset(
+                event.rule_id for event in ledger.events if event.rule_id in non_offsettable
+            )
         return result
 
     def _ledger_for_node(

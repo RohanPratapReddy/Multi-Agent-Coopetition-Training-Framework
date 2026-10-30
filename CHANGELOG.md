@@ -85,6 +85,22 @@ All notable changes to `mactf` are recorded here. The format follows
   `factory()`.
 - New extra `asgi` (optional `uvicorn` for the ASGI adapter), plus `scipy`, `peft`,
   `quant`, `train`, `tensorboard`, `wandb`.
+- Component customization (design doc 17, `mactf.components`): every pluggable part of
+  training (scoring stages and reward terms, training policies, RL functions,
+  optimizers and schedulers, weight-update and peer strategies, aggregators, peer
+  factories) is a component of a declared kind, chosen by a layered spec under the new
+  `COMPONENTS`, `COMPLIANCE` and `RL` settings blocks (plus `conf/components.yaml` and
+  `conf/rl.yaml`). Compliance guards (`ComplianceGuard`, `StepGuard`, `WeightGuard`,
+  `StrategyGuard`, `RollupGuard`) keep a customization from weakening the rules; origins,
+  locking and mid-run swaps are atomic at their boundary; checkpoints record the manifest
+  of non-default components and verify it on resume (registry migration 4); peers can be
+  added, retired, revived and purged mid-run through `MutationPlan`; `TrainerEngine`
+  (`ORCHESTRATOR.ENGINE = "trainer"`) is the opt-in engine that hosts all of it. New CLI:
+  `mactf components {list,inspect,validate,scaffold,diff}`, `mactf runs components`,
+  `mactf peers mutate`, `mactf run --component-module`; new API routes under
+  `/api/v1/components`; system checks `mactf.components.E###` / `W###`; error codes E001-E096,
+  W001-W053, C/S/O/U/Y families (see `docs/components.md`). Inert by default: with nothing
+  configured the framework behaves, and checkpoints hash, as before.
 
 ### Fixed
 

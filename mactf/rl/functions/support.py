@@ -11,6 +11,7 @@ from typing import Any, Callable, ClassVar, Iterable, Mapping, Protocol, Sequenc
 import torch
 import torch.nn as nn
 
+from ...components.legacy import LegacyTable
 from ...exceptions import ContractError, ValidationError
 from ..loss import LossBreakdown, clip_gradients
 from ..policy import PolicyOutput, greedy_action, sample_action
@@ -756,53 +757,77 @@ class ExplicitSynthesis(_SupportBase):
 # ---------------------------------------------------------------------------
 # Registry tables
 # ---------------------------------------------------------------------------
-RETURN_FUNCTION_TYPES: dict[str, type] = {
-    "discounted": DiscountedReturn,
-    "monte_carlo": MonteCarloReturn,
-}
+RETURN_FUNCTION_TYPES: dict[str, type] = LegacyTable(
+    "rl_function.return",
+    {
+        "discounted": DiscountedReturn,
+        "monte_carlo": MonteCarloReturn,
+    },
+)
 
-REWARD_FUNCTION_TYPES: dict[str, type] = {
-    "scorecard": ScorecardReward,
-    "signal": SignalReward,
-    "callable": CallableReward,
-}
+REWARD_FUNCTION_TYPES: dict[str, type] = LegacyTable(
+    "rl_function.reward",
+    {
+        "scorecard": ScorecardReward,
+        "signal": SignalReward,
+        "callable": CallableReward,
+    },
+)
 
-REGULARIZATION_FUNCTION_TYPES: dict[str, type] = {
-    "l2": L2Regularization,
-    "weight_decay": WeightDecayRegularization,
-    "kl_to_reference": KLToReferenceRegularization,
-}
+REGULARIZATION_FUNCTION_TYPES: dict[str, type] = LegacyTable(
+    "rl_function.regularization",
+    {
+        "l2": L2Regularization,
+        "weight_decay": WeightDecayRegularization,
+        "kl_to_reference": KLToReferenceRegularization,
+    },
+)
 
-OBJECTIVE_TYPES: dict[str, type] = {
-    "loss": LossObjective,
-    "callable": CallableObjective,
-}
+OBJECTIVE_TYPES: dict[str, type] = LegacyTable(
+    "rl_function.objective",
+    {
+        "loss": LossObjective,
+        "callable": CallableObjective,
+    },
+)
 
-GRADIENT_FUNCTION_TYPES: dict[str, type] = {
-    "clip": ClipGradient,
-    "accumulate": AccumulateGradient,
-    "scale": ScaleGradient,
-}
+GRADIENT_FUNCTION_TYPES: dict[str, type] = LegacyTable(
+    "rl_function.gradient",
+    {
+        "clip": ClipGradient,
+        "accumulate": AccumulateGradient,
+        "scale": ScaleGradient,
+    },
+)
 
-METRIC_FUNCTION_TYPES: dict[str, type] = {
-    "accuracy": AccuracyMetric,
-    "loss": LossMetric,
-    "perplexity": PerplexityMetric,
-    "callable": CallableMetric,
-}
+METRIC_FUNCTION_TYPES: dict[str, type] = LegacyTable(
+    "rl_function.metric",
+    {
+        "accuracy": AccuracyMetric,
+        "loss": LossMetric,
+        "perplexity": PerplexityMetric,
+        "callable": CallableMetric,
+    },
+)
 
-ACTION_FUNCTION_TYPES: dict[str, type] = {
-    "greedy": GreedyAction,
-    "sampled": SampledAction,
-}
+ACTION_FUNCTION_TYPES: dict[str, type] = LegacyTable(
+    "rl_function.action",
+    {
+        "greedy": GreedyAction,
+        "sampled": SampledAction,
+    },
+)
 
-SYNTHESIS_FUNCTION_TYPES: dict[str, type] = {
-    "consensus": ConsensusSynthesis,
-    "weighted": WeightedConsensus,
-    "best": BestByScore,
-    "learned": LearnedSynthesizer,
-    "explicit": ExplicitSynthesis,
-}
+SYNTHESIS_FUNCTION_TYPES: dict[str, type] = LegacyTable(
+    "rl_function.synthesis",
+    {
+        "consensus": ConsensusSynthesis,
+        "weighted": WeightedConsensus,
+        "best": BestByScore,
+        "learned": LearnedSynthesizer,
+        "explicit": ExplicitSynthesis,
+    },
+)
 
 SUPPORT_FAMILIES: dict[str, dict[str, type]] = {
     "return": RETURN_FUNCTION_TYPES,

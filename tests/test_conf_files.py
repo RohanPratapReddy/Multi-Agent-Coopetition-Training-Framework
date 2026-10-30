@@ -28,10 +28,10 @@ def _write(directory, name, payload):
 
 
 # -- CONF_LAYOUT ------------------------------------------------------------------
-def test_layout_has_seventeen_distinct_files():
+def test_layout_has_nineteen_distinct_files():
     names = [entry.filename for entry in CONF_LAYOUT]
-    assert len(names) == 17
-    assert len(set(names)) == 17
+    assert len(names) == 19
+    assert len(set(names)) == 19
     assert all(name.endswith(".yaml") for name in names)
 
 
@@ -221,3 +221,28 @@ def test_relative_paths_root_resolves_against_the_project_directory(tmp_path):
     values, _ = load_conf_tree({}, tmp_path)
     assert values["PATHS"]["ROOT"] == str(tmp_path.resolve())
     assert values["PATHS"]["VAR"] == "var"
+
+
+def test_the_two_new_blocks_have_owners():
+    from mactf.conf_files import owner_of
+
+    assert owner_of("COMPONENTS") == "components.yaml"
+    assert owner_of("COMPLIANCE") == "components.yaml"
+    assert owner_of("RL") == "rl.yaml"
+
+
+def test_load_order_places_components_second_and_rl_after_loss():
+    names = [entry.filename for entry in CONF_LAYOUT]
+    assert names[:3] == ["conf.yaml", "mactf.yaml", "components.yaml"]
+    assert names.index("rl.yaml") == names.index("loss.yaml") + 1
+
+
+def test_a_key_written_by_the_wrong_file_names_both(tmp_path):
+    from mactf.conf_files import load_conf_tree
+    from mactf.exceptions import ImproperlyConfigured
+
+    conf = tmp_path / "conf"
+    _write(conf, "scorer.yaml", {"COMPLIANCE": {"GUARD_MODE": "fallback"}})
+    with pytest.raises(ImproperlyConfigured) as caught:
+        load_conf_tree({"CONF_DIR": str(conf)}, tmp_path)
+    assert "scorer.yaml" in str(caught.value) and "components.yaml" in str(caught.value)

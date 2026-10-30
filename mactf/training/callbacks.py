@@ -39,6 +39,7 @@ HOOK_NAMES: tuple[str, ...] = (
     "on_score",
     "on_aggregate",
     "on_epoch_end",
+    "on_tree_mutated",
     "on_resume",
     "on_close",
 )
@@ -70,6 +71,10 @@ class Callback:
         return None
 
     def on_epoch_end(self, trainer: Any, result: Any) -> None:
+        return None
+
+    def on_tree_mutated(self, trainer: Any, report: Any) -> None:
+        """A plan committed. ``report`` is the :class:`MutationReport`; the trainer is consistent again."""
         return None
 
     def on_resume(self, trainer: Any, report: Any) -> None:
@@ -314,6 +319,11 @@ class EarlyStopping(Callback):
         self.min_delta = float(min_delta)
         self.mode = mode
         self.best: float | None = None
+        self.bad_epochs = 0
+
+    def on_tree_mutated(self, trainer: Any, report: Any) -> None:
+        """The loss is measured on a different cohort now: start the comparison over (W-G7)."""
+        self.best = None
         self.bad_epochs = 0
 
     def on_epoch_end(self, trainer: Any, result: Any) -> None:

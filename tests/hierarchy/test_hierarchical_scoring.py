@@ -174,7 +174,8 @@ def test_describe_reports_the_configuration():
     ).describe()
     assert payload["attribution"] == "own"
     assert payload["rollup"] == "mean"
-    assert payload["non_offsettable"] == ["P1"]
+    # document 17 section 6.6 (H1): a configured set widens the catalog set, never narrows it
+    assert payload["non_offsettable"] == ["P1", "P17", "P2", "P20", "P21", "P22"]
     assert payload["shared_pipeline"] is True
 
 

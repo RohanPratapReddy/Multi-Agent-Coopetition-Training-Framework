@@ -43,8 +43,8 @@ def _tables(registry: Registry) -> set[str]:
 def test_v1_database_migrates_to_v2(tmp_path):
     registry = _v1_database(tmp_path / "v1.sqlite3")
     assert registry.schema_version() == 1
-    assert registry.migrate() == [2, 3]
-    assert registry.schema_version() == SCHEMA_VERSION == 3
+    assert registry.migrate() == [2, 3, 4]
+    assert registry.schema_version() == SCHEMA_VERSION == 4
 
 
 def test_new_tables_exist(tmp_path):
@@ -65,7 +65,7 @@ def test_rule_events_gains_reversal_columns(tmp_path):
 
 def test_migration_is_idempotent(tmp_path):
     registry = Registry(tmp_path / "fresh.sqlite3")
-    assert registry.migrate() == [1, 2, 3]
+    assert registry.migrate() == [1, 2, 3, 4]
     assert registry.migrate() == []
 
 
@@ -82,7 +82,7 @@ def test_fresh_database_goes_straight_to_v2(tmp_path):
     registry = Registry(tmp_path / "fresh.sqlite3")
     assert registry.schema_version() == 0
     registry.migrate()
-    assert registry.schema_version() == 3
+    assert registry.schema_version() == SCHEMA_VERSION == 4
     assert {"warnings", "adjudications", "aggregations", "resume_reports"} <= _tables(registry)
 
 

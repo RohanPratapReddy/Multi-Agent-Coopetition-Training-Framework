@@ -11,6 +11,8 @@ from conf_project import edit_conf, leaves, load, scaffold
 from mactf import conf
 from mactf.conf import (
     CHECKPOINT_DEFAULTS,
+    COMPLIANCE_DEFAULTS,
+    COMPONENTS_DEFAULTS,
     CORS_DEFAULTS,
     DEFAULTS,
     LOGGER_DEFAULTS,
@@ -35,6 +37,10 @@ NEW_BLOCKS = {
     "CHECKPOINT": CHECKPOINT_DEFAULTS,
     "ORCHESTRATOR": ORCHESTRATOR_DEFAULTS,
     "CORS": CORS_DEFAULTS,
+    # document 17 section 15.1
+    "COMPONENTS": COMPONENTS_DEFAULTS,
+    # document 17 section 6.6
+    "COMPLIANCE": COMPLIANCE_DEFAULTS,
 }
 
 
@@ -61,6 +67,11 @@ def test_documented_default_values():
     assert CHECKPOINT_DEFAULTS["DIR"] is None and CHECKPOINT_DEFAULTS["CHECKSUM"] == "sha256"
     assert ORCHESTRATOR_DEFAULTS["MAX_EPOCHS"] is None
     assert CORS_DEFAULTS["ORIGINS"] == []
+    # document 17 section 15.1: every default is the one that changes nothing
+    assert COMPONENTS_DEFAULTS["ALLOW_BUILTIN_OVERRIDE"] is False
+    assert COMPONENTS_DEFAULTS["LOCKED"] == [] and COMPONENTS_DEFAULTS["MODULES"] == []
+    assert COMPONENTS_DEFAULTS["PLUGINS"] == "auto" and COMPONENTS_DEFAULTS["MAX_PER_KIND"] == 512
+    assert COMPONENTS_DEFAULTS["STRICT_RESTORE"] is False and COMPONENTS_DEFAULTS["ALLOW_IMPORT"] is False
 
 
 # -- drift: DEFAULTS and the shipped YAML are two copies of the same numbers ------
@@ -192,7 +203,9 @@ REFUSALS = [
     ("trainer.yaml", _set("TRAINER", PEER_STRATEGY="nonsense"), "TRAINER.PEER_STRATEGY must be one of"),
     ("trainer.yaml", _set("TRAINER", WEIGHT_UPDATE="nonsense"), "TRAINER.WEIGHT_UPDATE must be one of"),
     ("trainer.yaml", _set("TRAINER", SHARING="nonsense"), "TRAINER.SHARING must be one of"),
-    ("optimizer.yaml", _set("OPTIMIZER", TYPE="nonsense"), "OPTIMIZER.TYPE must be"),
+    # document 17 section 9.4: any registered name is a valid TYPE, so a name is judged by the
+    # optimizer plan at build, not at load; what a load can refuse is a TYPE that is not a name.
+    ("optimizer.yaml", _set("OPTIMIZER", TYPE=""), "OPTIMIZER.TYPE must be a non-empty string"),
     ("optimizer.yaml", _set("OPTIMIZER", LR=-1.0), "OPTIMIZER.LR must be >= 0"),
     ("optimizer.yaml", _set("OPTIMIZER", WEIGHT_DECAY=-1.0), "OPTIMIZER.WEIGHT_DECAY must be >= 0"),
     ("optimizer.yaml", _set("OPTIMIZER", GRAD_ACCUMULATION=0), "OPTIMIZER.GRAD_ACCUMULATION must be >= 1"),
@@ -269,3 +282,26 @@ def test_a_default_only_project_is_not_refused_by_the_new_validators():
     import copy
 
     _validate_blocks(Settings(copy.deepcopy(DEFAULTS)))
+
+
+# -- document 17 section 15.1: the COMPONENTS block ----------------------------------
+def test_components_is_in_defaults_and_owned_by_components_yaml():
+    """Document 17 section 15.3: ``conf/components.yaml`` owns COMPONENTS and COMPLIANCE."""
+    assert "COMPONENTS" in DEFAULTS
+    owners = [entry.filename for entry in CONF_LAYOUT if "COMPONENTS" in entry.owns]
+    assert owners == ["components.yaml"]
+
+
+def test_components_validators_run_on_a_generated_project(tmp_path, monkeypatch, project):
+    edit_conf(project, "components.yaml", lambda p: p["COMPONENTS"].update(MAX_PER_KIND=0))
+    with pytest.raises(ImproperlyConfigured, match=r"E013: COMPONENTS.MAX_PER_KIND must be an integer >= 1"):
+        load(tmp_path, monkeypatch)
+
+
+def test_a_project_that_writes_components_keeps_the_rest_of_the_defaults(tmp_path, monkeypatch, project):
+    edit_conf(project, "components.yaml", lambda p: p["COMPONENTS"].update(STRICT_LEGACY=True))
+    loaded = load(tmp_path, monkeypatch)
+    assert loaded["COMPONENTS"]["STRICT_LEGACY"] is True
+    assert {k: v for k, v in loaded["COMPONENTS"].items() if k != "STRICT_LEGACY"} == {
+        k: v for k, v in COMPONENTS_DEFAULTS.items() if k != "STRICT_LEGACY"
+    }

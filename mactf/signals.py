@@ -122,5 +122,8 @@ phase_finished = Signal("phase_finished")
 checkpoint_written = Signal("checkpoint_written")
 checkpoint_rolled_back = Signal("checkpoint_rolled_back")
 
+# Topology lifecycle (document 17 section 12.8)
+tree_mutated = Signal("tree_mutated")
+
 # Startup
 app_ready = Signal("app_ready")

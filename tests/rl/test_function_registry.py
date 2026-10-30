@@ -159,3 +159,94 @@ def test_family_aliases_match_the_tables():
 
 
 import pytest  # noqa: E402  (kept last so the module reads bottom-up)
+
+
+# -- document 17 section 3.6: every table is a live view of the component hub ----------------
+def test_every_family_table_is_a_live_view_of_its_hub_registry():
+    from mactf.components import HUB, LegacyTable, Origin
+
+    for family in CAPABILITY_ORDER:
+        table = FUNCTION_TYPES[family]
+        assert isinstance(table, LegacyTable) and isinstance(table, dict)
+        assert table.kind_id == f"rl_function.{family}"
+        components = HUB.registry(table.kind_id).components()
+        assert dict(table) == {c.name: c.factory for c in components}
+        assert {c.origin for c in components} == {Origin.BUILTIN}
+
+
+def test_a_write_to_a_family_table_reaches_the_hub_and_back():
+    from mactf.components import HUB, Origin
+
+    class Marker:
+        def __init__(self, *, flag: bool = False) -> None:
+            self.flag = flag
+
+    try:
+        FUNCTION_TYPES["rollup"]["marker_view"] = Marker
+        component = HUB.registry("rl_function.rollup").get("marker_view")
+        assert component.factory is Marker and component.origin is Origin.RUNTIME
+        assert build_function({"type": "marker_view", "flag": True}, family="rollup").flag is True
+    finally:
+        FUNCTION_TYPES["rollup"].pop("marker_view", None)
+    assert not HUB.registry("rl_function.rollup").has("marker_view")
+
+
+def test_replacing_and_restoring_a_builtin_through_the_table_round_trips_the_hub():
+    from mactf.components import HUB, Origin
+
+    class Marker:
+        pass
+
+    original = FUNCTION_TYPES["rollup"]["mean"]
+    before = HUB.registry("rl_function.rollup").get("mean").describe()
+    try:
+        register_function("rollup", "mean", Marker, replace=True)
+        assert HUB.registry("rl_function.rollup").get("mean").overrides_builtin
+    finally:
+        FUNCTION_TYPES["rollup"]["mean"] = original
+    restored = HUB.registry("rl_function.rollup").get("mean")
+    assert restored.origin is Origin.BUILTIN and restored.describe() == before
+
+
+def test_register_function_refusals_are_component_errors_that_stay_validation_errors():
+    from mactf.exceptions import ComponentCollision, ComponentContractError, ComponentError
+
+    class Marker:
+        pass
+
+    try:
+        register_function("rollup", "mean", Marker)
+    except ValidationError as error:
+        assert isinstance(error, ComponentCollision) and isinstance(error, ComponentError)
+        assert error.code == "E002"
+    else:  # pragma: no cover
+        raise AssertionError("expected a collision")
+    try:
+        register_function("rollup", "bad name", Marker)
+    except ValidationError as error:
+        assert isinstance(error, ComponentContractError) and error.code == "E007"
+
+
+def test_register_function_has_a_decorator_form_that_returns_the_class():
+    class Rollup:
+        def rollup(self, parent, children, *, weights=None, scores=None):
+            return parent
+
+    try:
+        assert register_function("rollup", "deco_probe")(Rollup) is Rollup
+        assert FUNCTION_TYPES["rollup"]["deco_probe"] is Rollup
+    finally:
+        FUNCTION_TYPES["rollup"].pop("deco_probe", None)
+
+
+def test_an_unknown_family_keeps_its_historical_message_through_register_function():
+    import pytest
+
+    with pytest.raises(ValidationError, match="unknown function family 'nonsense'; accepted families: "):
+        register_function("nonsense", "x", object)
+
+
+def test_capability_order_is_the_component_family_order():
+    from mactf.components import RL_FAMILIES
+
+    assert CAPABILITY_ORDER == RL_FAMILIES

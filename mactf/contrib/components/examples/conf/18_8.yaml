@@ -1,0 +1,6 @@
+# 18.8: retire, revive and purge. Plans are data (plans/*.yaml); mutation must be enabled.
+ORCHESTRATOR: {ENGINE: trainer}
+TRAINER:
+  MUTATION:
+    ENABLED: true
+    PROTECTED: ["peer-1"]

@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping
 from . import Candidate, CompletionContext
 
 LOG_KINDS = ("run", "epoch", "step", "loss", "score", "aggregation", "warning",
-             "checkpoint", "health", "resume", "log")
+             "checkpoint", "health", "resume", "mutation", "log")
 
 
 def _first_line(text: str) -> str:
@@ -176,10 +176,47 @@ def peer_assignment(ctx: CompletionContext) -> Iterator[str]:
             yield name + "="
 
 
+def component_kind(ctx: CompletionContext) -> list[str]:
+    """Every kind id, including ``rl_function.<family>`` (document 17, 15.4)."""
+    from ...components.kinds import all_kind_ids
+
+    return sorted(all_kind_ids())
+
+
+def component_name(ctx: CompletionContext) -> list[str]:
+    """Names for the kind already typed on the line (``--kind K`` or the first positional)."""
+    from ...components.known import BUILTIN_NAMES, known_names
+
+    given = ctx.given.get("kind") or ()
+    kind = given[0] if given else None
+    if kind is None or kind not in BUILTIN_NAMES:
+        return sorted({name for names in BUILTIN_NAMES.values() for name in names})
+    return sorted(known_names(kind) or ())
+
+
+def _slot_paths(ctx: CompletionContext) -> set[str]:
+    """The slots a project has: the ones settings name, plus the ones every run has."""
+    from ...components.kinds import RL_FAMILIES
+    from ...components.known import configured_specs
+
+    paths = {"TRAINER.WEIGHT_UPDATE", "TRAINER.PEER_STRATEGY", "TRAINER.POLICY", "TRAINER.AGGREGATOR",
+             "OPTIMIZER", "SCORING.STAGES.reward", "SCORING.STAGES.penalty", "SCORING.STAGES.warning"}
+    paths |= {f"RL.{family.upper()}" for family in RL_FAMILIES}
+    if ctx.settings is not None:
+        paths |= {slot for slot, _kind, _raw in configured_specs(ctx.settings)}
+    return paths
+
+
+def slot_path(ctx: CompletionContext) -> list[str]:
+    """Slot paths of the configured project: ``TRAINER.WEIGHT_UPDATE``, ``RL.LOSS`` and so on."""
+    return sorted(_slot_paths(ctx))
+
+
 COMPLETERS: dict[str, Callable[[CompletionContext], Iterable[Any]]] = {
     "command": command, "shell": shell, "run_id": run_id, "resumable_run_id": resumable_run_id,
     "run_status": run_status, "injector": injector, "check_app": check_app, "check_tag": check_tag,
     "log_kind": log_kind, "setting_key": setting_key, "setting_assignment": setting_assignment,
     "rule_id": rule_id, "rule_tag": rule_tag, "peer_name": peer_name,
-    "peer_assignment": peer_assignment,
+    "peer_assignment": peer_assignment, "component_kind": component_kind,
+    "component_name": component_name, "slot_path": slot_path,
 }

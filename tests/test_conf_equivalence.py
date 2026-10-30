@@ -38,6 +38,7 @@ INSTALLED_APPS = [
     "mactf.contrib.coopetition",
     "mactf.contrib.sandbox",
     "mactf.contrib.telemetry",
+    "mactf.contrib.components",
     "demo_swarm.peers",
 ]
 
@@ -407,7 +408,8 @@ SNAPSHOT = {'AMP': False,
  'INSTALLED_APPS': ['mactf.contrib.scoring',
                     'mactf.contrib.coopetition',
                     'mactf.contrib.sandbox',
-                    'mactf.contrib.telemetry'],
+                    'mactf.contrib.telemetry',
+                    'mactf.contrib.components'],
  'MIDDLEWARE': ['mactf.http.middleware.RequestIdMiddleware',
                 'mactf.http.middleware.ExceptionMiddleware'],
  'PATHS': {'CHECKPOINTS': 'var/checkpoints',
@@ -565,9 +567,32 @@ def test_the_snapshot_covers_every_pre_existing_block():
     added = {
         "TRAINER", "OPTIMIZER", "LOSS", "LOGGER", "WATCHDOG", "CHECKPOINT",
         "ORCHESTRATOR", "CORS", "CONF_DIR", "DISTILLATION",
+        # document 17 section 15.1: the component registry's policy block
+        "COMPONENTS",
+        # document 17 section 6.6: the compliance floor and guard
+        "COMPLIANCE",
+        # document 17 section 8.5: RL function defaults and overrides
+        "RL",
     }
     assert set(DEFAULTS) - added == set(SNAPSHOT)
 
 
 def test_paths_only_gained_keys():
     assert set(DEFAULTS["PATHS"]) - set(SNAPSHOT["PATHS"]) == {"RUNS", "TEACHERS", "AUDITS", "CACHE", "STATE"}
+
+
+# -- document 17 section 15.1: the COMPONENTS block changes nothing for either project ----
+def test_the_components_block_is_the_default_in_both_projects(pair):
+    legacy, modern = pair
+    assert legacy["COMPONENTS"] == modern["COMPONENTS"] == DEFAULTS["COMPONENTS"]
+    # a legacy project leaves it at the framework default, so `mactf config --changed` shows
+    # nothing; a generated project now ships conf/components.yaml (document 17 section 15.3),
+    # which spells the same values out and so records the block as written by that file
+    assert "COMPONENTS" not in legacy["_AUTHORED"]
+
+
+def test_a_default_components_block_is_exactly_the_default_hub_policy(pair):
+    from mactf.components import HubPolicy, policy_from_settings
+
+    for project in pair:
+        assert policy_from_settings(project["COMPONENTS"]) == HubPolicy()

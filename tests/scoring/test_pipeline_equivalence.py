@@ -321,6 +321,8 @@ def test_duplicate_kind_is_rejected(score_config, severity_weights):
 
 def test_no_bypass_gate(score_config, severity_weights, warning_policy):
     """A reward stage that ignores a P1 still cannot make the score positive."""
+    from mactf.components.guards.compliance import ComplianceGuard, GuardPolicy
+    from mactf.exceptions import ComplianceGuardViolation
     from mactf.scoring.reward_scorer import RewardScorer
 
     class LyingReward(RewardScorer):
@@ -346,10 +348,19 @@ def test_no_bypass_gate(score_config, severity_weights, warning_policy):
         score_config=score_config,
         severity_weights=severity_weights,
         warning_policy=warning_policy,
+        guard=ComplianceGuard(GuardPolicy(mode="fallback")),
     )
     card = pipeline.score_peer(_ledger("a", {"R1": 1.0, "P1": 1.0}), peer="a", episode=1)
     assert card.is_void
     assert card.final_score <= 0.0
+    # Document 17 section 6.4: a reward above the ceiling is C008, refused under the
+    # default ``enforce`` mode and replaced by the reference reward under ``fallback``.
+    assert card.metadata["compliance_guard"]["violations"][0]["code"] == "C008"
+    assert card.metadata["compliance_guard"]["substituted"] == ["reward"]
+    pipeline.guard = ComplianceGuard()
+    with pytest.raises(ComplianceGuardViolation) as excinfo:
+        pipeline.score_peer(_ledger("a", {"R1": 1.0, "P1": 1.0}), peer="a", episode=2)
+    assert excinfo.value.code == "C008"
 
 
 def test_points_fields_are_untouched_by_the_pipeline(

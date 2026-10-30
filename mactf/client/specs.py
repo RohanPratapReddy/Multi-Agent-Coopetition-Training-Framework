@@ -11,11 +11,20 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-__all__ = ["adamw", "consensus", "lora", "optimizer", "scorers", "trainer"]
+__all__ = [
+    "adamw", "component", "components", "consensus", "lora", "mutation", "optimizer", "scorers", "trainer",
+]
 
 
 def _drop_none(values: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in values.items() if value is not None}
+
+
+def _spec_value(value: Mapping[str, Any] | str | None) -> Any:
+    """A component field takes a name or a spec mapping; both go over the wire unchanged."""
+    if value is None or isinstance(value, str):
+        return value
+    return dict(value)
 
 
 def optimizer(
@@ -97,8 +106,8 @@ def trainer(
     loss: Mapping[str, Any] | None = None,
     finetuning: Mapping[str, Any] | None = None,
     scorers: Mapping[str, Any] | None = None,
-    peer_strategy: Mapping[str, Any] | None = None,
-    weight_update: Mapping[str, Any] | None = None,
+    peer_strategy: Mapping[str, Any] | str | None = None,
+    weight_update: Mapping[str, Any] | str | None = None,
     grad_accumulation: int | None = None,
     max_grad_norm: float | None = None,
     steps_per_epoch: int | None = None,
@@ -127,10 +136,30 @@ def trainer(
         "loss": dict(loss) if loss is not None else None,
         "finetuning": dict(finetuning) if finetuning is not None else None,
         "scorers": dict(scorers) if scorers is not None else None,
-        "peer_strategy": dict(peer_strategy) if peer_strategy is not None else None,
-        "weight_update": dict(weight_update) if weight_update is not None else None,
+        "peer_strategy": _spec_value(peer_strategy),
+        "weight_update": _spec_value(weight_update),
         "grad_accumulation": grad_accumulation,
         "max_grad_norm": max_grad_norm,
         "steps_per_epoch": steps_per_epoch,
         "distillation": distillation_block,
     })
+
+
+def component(type: str | None = None, *, import_: str | None = None, **params: Any) -> dict[str, Any]:
+    """A ``ComponentSpec``: ``component("trimmed_mean", trim=0.2)`` or ``component(import_="pkg.mod:Cls")``."""
+    if (type is None) == (import_ is None):
+        raise ValueError("give exactly one of type and import_")
+    spec: dict[str, Any] = {"type": type} if type is not None else {"import": import_}
+    if params:
+        spec["params"] = dict(params)
+    return spec
+
+
+def components(**slots: Mapping[str, Any] | str) -> dict[str, Any]:
+    """``{slot: spec}`` for settings files and for several ``PATCH runs/{id}/components`` calls."""
+    return {slot: ({"type": value} if isinstance(value, str) else dict(value)) for slot, value in slots.items()}
+
+
+def mutation(*ops: Mapping[str, Any], label: str | None = None, reason: str | None = None) -> dict[str, Any]:
+    """A ``MutationPlan`` body: ``mutation({"op": "retire", "path": "root/w3"}, label="prune")``."""
+    return _drop_none({"plan": [dict(op) for op in ops], "label": label, "reason": reason})

@@ -16,6 +16,7 @@ The concurrency model is plain threads (document 01 section 3):
 from __future__ import annotations
 
 import collections
+import contextvars
 import copy
 import dataclasses
 import enum
@@ -29,7 +30,7 @@ from typing import Any, Callable, Iterator, Mapping
 from .. import signals
 from ..conf import Settings
 from ..db import TERMINAL_STATUSES, Registry, ensure_registry
-from ..exceptions import ImproperlyConfigured, MACTFError
+from ..exceptions import ImproperlyConfigured, MACTFError, StateConflict
 from .orchestrator import Orchestrator, RunConfig
 
 logger = logging.getLogger("mactf.live")
@@ -45,13 +46,18 @@ __all__ = [
     "RunState",
     "RunStateError",
     "Subscription",
+    "MutationSimulation",
     "jsonable",
+    "manager_for_cli",
+    "set_cli_manager",
 ]
 
 #: The fixed event vocabulary of document 02 section 3.4.
 EVENT_NAMES = (
     "run", "phase", "epoch", "warning", "incident", "checkpoint", "rollback",
     "terminal", "heartbeat",
+    # Document 17 section 12.8: a committed tree mutation (``tree_mutated`` signal).
+    "tree",
 )
 
 
@@ -370,7 +376,9 @@ class RunHandle:
         self.summary: dict[str, Any] | None = None
         self.epochs_completed = 0
         self.thread: threading.Thread | None = None
-        self.orchestrator: Orchestrator | None = None
+        #: The engine driving this run: an ``Orchestrator`` or a ``TrainerEngine`` (document 17
+        #: section 13). The name is historical; it is not always an orchestrator.
+        self.orchestrator: Any = None
         #: Real components a caller attached (``trainer``, ``logger``, ``watchdog``,
         #: ``checkpoint``); the API's observability routes read them.
         self.components: dict[str, Any] = {}
@@ -378,6 +386,11 @@ class RunHandle:
         self._cancel = threading.Event()
         self._pause = threading.Event()
         self.lock = threading.RLock()
+
+    @property
+    def engine(self) -> Any:
+        """The same object under the name section 13 uses."""
+        return self.orchestrator
 
     @property
     def status(self) -> str:
@@ -443,7 +456,7 @@ class RunManager:
         registry: Registry | None = None,
         bus: EventBus | None = None,
         modules: Mapping[str, Any] | None = None,
-        orchestrator_factory: Callable[[Settings, Registry], Orchestrator] | None = None,
+        orchestrator_factory: Callable[[Settings, Registry], Any] | None = None,
         max_concurrent: int | None = None,
         cancel_grace: float | None = None,
     ) -> None:
@@ -470,8 +483,11 @@ class RunManager:
         self._connect_signals()
 
     # -- construction helpers ------------------------------------------------
-    def _default_factory(self, settings: Settings, registry: Registry) -> Orchestrator:
-        return Orchestrator(settings, modules=self.modules, registry=registry)
+    def _default_factory(self, settings: Settings, registry: Registry) -> Any:
+        """The configured engine, built with this manager's modules and registry."""
+        from .dispatch import engine_factory
+
+        return engine_factory(settings, registry, modules=self.modules)
 
     def _run_settings(self) -> Settings:
         """A private copy: ``Orchestrator.prepare`` writes DEVICE/SEED into settings."""
@@ -491,6 +507,7 @@ class RunManager:
             (signals.aggregation_completed, self._on_aggregation),
             (signals.checkpoint_written, self._on_checkpoint),
             (signals.checkpoint_rolled_back, self._on_rollback),
+            (signals.tree_mutated, self._on_tree_mutated),
         ]
         for signal, receiver in table:
             signal.connect(receiver, weak=False)
@@ -552,6 +569,11 @@ class RunManager:
         handle = self.get_handle(run_id)
         if handle is None:
             return None
+        # A trainer engine's tree wins: it is the object mutations change (section 12), so a
+        # hierarchy, its statuses and its retired set are the truth. ``Orchestrator`` has no ``tree``.
+        engine_tree = getattr(handle.orchestrator, "tree", None)
+        if engine_tree is not None:
+            return engine_tree
         trainer = handle.components.get("trainer")
         if trainer is not None and getattr(trainer, "tree", None) is not None:
             return trainer.tree
@@ -565,6 +587,104 @@ class RunManager:
             node = tree.get(name)
             node.peer = peer
         return tree
+
+    # -- components and tree mutation (document 17 section 16) ------------------------
+    def _live_trainer(self, run_id: str, action: str) -> Any:
+        """The trainer of a run this manager is driving; the right error when there is none.
+
+        ``RunNotFound`` for an id nobody knows, ``RunStateError`` (HTTP 409, CLI exit 4) for a
+        run that is not live, ``StateConflict`` for a live run whose engine has no trainer
+        (the ``Orchestrator`` has no component slots to change).
+        """
+        handle = self.get_handle(run_id)
+        if handle is None:
+            row = self.registry.get_run(run_id)
+            if row is None:
+                raise RunNotFound(run_id)
+            raise RunStateError(run_id, str(row["status"]), action)
+        if not handle.state.live:
+            raise RunStateError(run_id, handle.status, action)
+        trainer = handle.components.get("trainer") or getattr(handle.orchestrator, "trainer", None)
+        if trainer is None or getattr(trainer, "slots", None) is None:
+            raise StateConflict(
+                f"run {run_id!r} is driven by an engine with no component slots; "
+                "select ORCHESTRATOR.ENGINE=trainer",
+                run_id=run_id, action=action,
+            )
+        return trainer
+
+    def components(self, run_id: str) -> dict[str, Any]:
+        """A run's components: every slot, what is queued, and what was swapped.
+
+        A live trainer answers from its slot view (the table plus the components the plans
+        hold); any other run answers from its newest checkpoint's ``identity["components"]``
+        manifest with ``"source": "checkpoint"``, or the registry's copy of it.
+        """
+        handle = self.get_handle(run_id)
+        trainer = None
+        if handle is not None and handle.state.live:
+            trainer = handle.components.get("trainer") or getattr(handle.orchestrator, "trainer", None)
+        if trainer is not None and getattr(trainer, "slots", None) is not None:
+            return _live_components(run_id, trainer)
+        row = self.registry.get_run(run_id)
+        if row is None and handle is None:
+            raise RunNotFound(run_id)
+        return _stored_components(self.registry, run_id)
+
+    def request_components(
+        self,
+        run_id: str,
+        slot: str,
+        spec: Any,
+        *,
+        trusted: bool = False,
+        boundary: str = "episode",
+        immediate: bool = False,
+    ) -> dict[str, Any]:
+        """Queue a spec (or a patch of one) for ``slot`` at the next boundary.
+
+        The spec is resolved *now*, so a bad one is refused with its own code and nothing is
+        queued. ``trusted=False`` is the API: an ``import:`` spec is refused (``E006``) unless
+        ``COMPONENTS`` allows it. ``immediate`` additionally refuses a slot whose mutability
+        cannot take ``boundary`` (the ordinary request refuses that too; the flag is what
+        ``--now`` records in the answer).
+        """
+        trainer = self._live_trainer(run_id, "change the components of")
+        return _request_components(
+            run_id, trainer, slot, spec, trusted=trusted, boundary=boundary, immediate=immediate
+        )
+
+    def simulate_mutation(self, run_id: str, plan: Any) -> "MutationSimulation":
+        """Run a plan through the topology simulator against the live tree. Changes nothing."""
+        from ..training.mutation import MutationPlan
+
+        trainer = self._live_trainer(run_id, "simulate a mutation of")
+        parsed = MutationPlan.parse(plan)
+        simulation = trainer.engine.simulator("api").run(parsed)
+        return MutationSimulation(parsed, simulation)
+
+    def request_mutation(
+        self, run_id: str, plan: Any, *, label: str = "", reason: str = "", source: str = "api"
+    ) -> dict[str, Any]:
+        """Queue a plan for the top of the next epoch. A plan with a hard finding is refused now."""
+        from ..training.mutation import MutationPlan
+
+        trainer = self._live_trainer(run_id, "mutate")
+        parsed = MutationPlan.parse(plan)
+        if label or reason:
+            parsed = dataclasses.replace(
+                parsed, label=str(label or parsed.label), reason=str(reason or parsed.reason)
+            )
+        trainer.engine.simulator(source).run(parsed).raise_for_findings()
+        queued = trainer.request_mutation(parsed, source=source)
+        return {
+            "run_id": run_id,
+            "label": queued.label,
+            "digest": queued.digest(),
+            "source": source,
+            "applies_at": "next epoch boundary",
+            "queued_at": _utc_now(),
+        }
 
     def _emit(self, event: str, data: Mapping[str, Any]) -> None:
         run_id = self._current_run()
@@ -631,6 +751,10 @@ class RunManager:
     def _on_rollback(self, signal=None, sender=None, reason=None, episode=None, **_: Any) -> None:
         self._emit("rollback", {"reason": reason, "episode": episode})
 
+    def _on_tree_mutated(self, signal=None, sender=None, report=None, **_: Any) -> None:
+        as_dict = getattr(report, "as_dict", None)
+        self._emit("tree", dict(as_dict()) if callable(as_dict) else {})
+
     # -- starting -------------------------------------------------------------
     def start(self, request: RunConfig | Mapping[str, Any] | None = None) -> RunHandle:
         """Queue a run and start its thread. Raises :class:`CapacityExceeded`."""
@@ -667,8 +791,18 @@ class RunManager:
         return handle
 
     def _spawn(self, handle: RunHandle) -> None:
+        """Start the run thread *inside the caller's context*.
+
+        ``contextvars`` reaches an ``asyncio`` task automatically but not a new
+        ``threading.Thread``. The component overlay of document 17 section 3.5 lives in a
+        ``ContextVar``; without this capture a trainer run started from an API request would lose
+        the overlay that registered its components and fail at the first ``resolve``. The context
+        is copied per spawn: a ``Context`` may only be entered once at a time, and a resumed run
+        is a new thread.
+        """
+        ctx = contextvars.copy_context()
         thread = threading.Thread(
-            target=self._run, args=(handle,), name=f"mactf-run-{handle.run_id}", daemon=True
+            target=ctx.run, args=(self._run, handle), name=f"mactf-run-{handle.run_id}", daemon=True
         )
         handle.thread = thread
         handle.done.clear()
@@ -763,6 +897,14 @@ class RunManager:
         except Exception as exc:  # noqa: BLE001
             self._fail(handle, exc)
             return
+        # A trainer run exposes its trainer, so ``/runs/{id}/tree`` and the observability routes
+        # read the live object instead of a flat copy; the run logger goes to it too.
+        trainer = getattr(orchestrator, "trainer", None)
+        if trainer is not None:
+            handle.components.setdefault("trainer", trainer)
+        attach = getattr(orchestrator, "attach_logger", None)
+        if callable(attach):
+            attach(handle.components["logger"])
         self._transition(handle, RunState.RUNNING)
         self._publish(handle.run_id, "run", {"status": "running"})
         try:
@@ -772,6 +914,13 @@ class RunManager:
         except BaseException as exc:  # noqa: BLE001
             self._fail(handle, exc, already_recorded=True)
             return
+        finally:
+            close = getattr(orchestrator, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # noqa: BLE001 - shutdown never fails a finished run
+                    logger.debug("could not close the %s engine", type(orchestrator).__name__, exc_info=True)
         handle.summary = {k: v for k, v in summary.items() if k != "history"}
         handle.epochs_completed = int(summary.get("epochs_completed", handle.epochs_completed) or 0)
         status = RunState(summary.get("status", "completed"))
@@ -1029,3 +1178,308 @@ class RunManager:
                 )
         self.close()
         return stragglers
+
+
+# ---------------------------------------------------------------------------
+# Components and mutation: the helpers behind RunManager (document 17 section 16)
+# ---------------------------------------------------------------------------
+def _utc_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+class MutationSimulation:
+    """A plan and what the topology simulator made of it: ``ok``, and ``as_dict`` for a body."""
+
+    def __init__(self, plan: Any, simulation: Any) -> None:
+        self.plan = plan
+        self.simulation = simulation
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.simulation.ok)
+
+    @property
+    def changed(self) -> bool:
+        s = self.simulation
+        return bool(s.added or s.purged or s.retired_now or s.revived_now or s.modified)
+
+    @staticmethod
+    def _finding(item: Any) -> dict[str, Any]:
+        return {"code": item.code, "message": item.message, "path": item.path}
+
+    def as_dict(self) -> dict[str, Any]:
+        s = self.simulation
+        return {
+            "ok": self.ok,
+            "changed": self.changed,
+            "label": self.plan.label,
+            "digest": self.plan.digest(),
+            "hard": [self._finding(item) for item in s.hard],
+            "soft": [self._finding(item) for item in s.soft],
+            "added": list(s.added),
+            "retired": list(s.retired_now),
+            "revived": list(s.revived_now),
+            "purged": list(s.purged),
+            "modified": list(s.modified),
+            "active_paths": list(s.active_paths()),
+        }
+
+
+def _jsonify(value: Any) -> Any:
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return _jsonify(dataclasses.asdict(value))
+    if isinstance(value, Mapping):
+        return {str(k): _jsonify(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_jsonify(v) for v in value]
+    if hasattr(value, "canonical") and callable(value.canonical):
+        return _jsonify(value.canonical())
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _pending_of(trainer: Any) -> dict[str, Any]:
+    """Every queued change, by slot path, whichever plan holds it."""
+    pending: dict[str, Any] = {}
+    for owner in (
+        trainer.slots, getattr(trainer, "weight_plan", None), getattr(trainer, "strategy_plan", None),
+        getattr(trainer, "optimizer_plan", None), getattr(trainer, "functions", None),
+    ):
+        getter = getattr(owner, "pending", None)
+        if callable(getter):
+            for path, value in dict(getter()).items():
+                pending[str(path)] = _jsonify(value)
+    return pending
+
+
+def _history_of(trainer: Any) -> list[dict[str, Any]]:
+    seen: set[tuple[Any, ...]] = set()
+    rows: list[dict[str, Any]] = []
+    owners = (
+        trainer.slots, getattr(trainer, "weight_plan", None), getattr(trainer, "strategy_plan", None),
+        getattr(trainer, "optimizer_plan", None), getattr(trainer, "functions", None),
+    )
+    for owner in owners:
+        history = getattr(owner, "history", None)
+        if callable(history):
+            history = history()
+        for record in tuple(history or ()):
+            row = _jsonify(record)
+            if not isinstance(row, dict):
+                continue
+            key = (row.get("slot"), row.get("at"), row.get("to_spec_hash"))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+    rows.sort(key=lambda r: (r.get("at") or 0.0))
+    return rows
+
+
+def _live_components(run_id: str, trainer: Any) -> dict[str, Any]:
+    from ..components.fingerprint import entry_for
+
+    view = trainer._slot_view()
+    slots = []
+    for path in view.paths():
+        slot = view.get(path)
+        entry = entry_for(slot)
+        entry["state"] = "live"
+        entry["mutability"] = slot.component.mutability.value
+        entry["locked"] = bool(getattr(trainer.slots, "_slot_locked", lambda _p: False)(path))
+        slots.append(entry)
+    return {
+        "run_id": run_id,
+        "source": "live",
+        "slots": slots,
+        "pending": _pending_of(trainer),
+        "history": _history_of(trainer),
+    }
+
+
+def _stored_components(registry: Registry, run_id: str) -> dict[str, Any]:
+    from ..runtime import load_checkpoint
+
+    manifest: Any = None
+    for row in reversed(registry.checkpoints(run_id)):
+        path = Path(row["path"])
+        if not path.exists():
+            continue
+        try:
+            payload = load_checkpoint(path)
+        except Exception:  # noqa: BLE001 - try the next-newest file
+            continue
+        identity = payload.get("identity") if isinstance(payload, Mapping) else None
+        found = identity.get("components") if isinstance(identity, Mapping) else None
+        if found:
+            manifest = found
+            break
+    if manifest is None:
+        manifest = registry.components(run_id)
+    slots = []
+    for kind, entries in sorted((manifest or {}).items()):
+        if not isinstance(entries, Mapping):
+            continue
+        for path, entry in sorted(entries.items()):
+            item = dict(entry) if isinstance(entry, Mapping) else {}
+            item.setdefault("kind", kind)
+            item.setdefault("slot", path)
+            item["state"] = "recorded"
+            slots.append(_jsonify(item))
+    return {"run_id": run_id, "source": "checkpoint", "slots": slots, "pending": {}, "history": []}
+
+
+_FAMILY_KINDS = ("weight_update", "peer_strategy")
+
+
+def _route_slot(trainer: Any, slot: str) -> tuple[str, str, str | None, str | None]:
+    """``(family, kind_id, glob, table_path)`` for a slot path the operator wrote.
+
+    ``family`` is one of ``weight``, ``strategy``, ``function``, ``optimizer`` or ``table``.
+    """
+    from ..components.kinds import RL_FAMILIES
+    from ..exceptions import ComponentMissing
+
+    text = slot.strip()
+    upper = text.upper()
+    if upper == "TRAINER.WEIGHT_UPDATE":
+        return "weight", "weight_update", None, "TRAINER.WEIGHT_UPDATE"
+    if upper.startswith("TRAINER.WEIGHT_UPDATE_OVERRIDES.") and len(text) > len("TRAINER.WEIGHT_UPDATE_OVERRIDES."):
+        glob = text[len("TRAINER.WEIGHT_UPDATE_OVERRIDES."):]
+        return "weight", "weight_update", glob, f"TRAINER.WEIGHT_UPDATE_OVERRIDES.{glob}"
+    if upper == "TRAINER.PEER_STRATEGY":
+        return "strategy", "peer_strategy", None, "TRAINER.PEER_STRATEGY"
+    if upper.startswith("TRAINER.PEER_STRATEGY_OVERRIDES.") and len(text) > len("TRAINER.PEER_STRATEGY_OVERRIDES."):
+        glob = text[len("TRAINER.PEER_STRATEGY_OVERRIDES."):]
+        return "strategy", "peer_strategy", glob, f"TRAINER.PEER_STRATEGY_OVERRIDES.{glob}"
+    if upper == "OPTIMIZER":
+        return "optimizer", "optimizer", None, "OPTIMIZER"
+    for prefix in ("OPTIMIZER.OVERRIDES.", "OPTIMIZER."):
+        if upper.startswith(prefix) and len(text) > len(prefix):
+            glob = text[len(prefix):]
+            return "optimizer", "optimizer", glob, f"OPTIMIZER.{glob}"
+    if upper.startswith("RL."):
+        head, _, rest = text[3:].partition(".")
+        if head.lower() in RL_FAMILIES:
+            family = head.lower()
+            glob = rest or None
+            path = f"RL.{family}" + (f".{glob}" if glob else "")
+            return "function", f"rl_function.{family}", glob, path
+    if upper.startswith("SCORING.STAGES."):
+        return "table", "scorer", None, "scoring." + text[len("SCORING.STAGES."):].lower()
+    known = trainer.slots.paths()
+    if text in known:
+        return "table", "", None, text
+    raise ComponentMissing("slot", text, sorted(set(known) | set(trainer._slot_view().paths())))
+
+
+def _optimizer_block(spec: Any) -> dict[str, Any]:
+    """An ``OPTIMIZER`` entry block from what an operator sent.
+
+    Upper-case keys are a block already; ``{type, params}`` is translated (``lr`` and
+    ``weight_decay`` are facade keys, the rest goes under ``PARAMS``).
+    """
+    if isinstance(spec, str):
+        return {"TYPE": spec}
+    data = dict(spec or {})
+    if data and all(str(k).isupper() for k in data):
+        return data
+    block: dict[str, Any] = {}
+    if data.get("type") is not None:
+        block["TYPE"] = data["type"]
+    params = dict(data.get("params") or {})
+    for key in ("lr", "weight_decay"):
+        if key in params:
+            block[key.upper()] = params.pop(key)
+    for key, value in data.items():
+        if str(key).isupper():
+            block[key] = value
+    if params:
+        block["PARAMS"] = params
+    return block
+
+
+def _request_components(
+    run_id: str, trainer: Any, slot: str, raw: Any, *,
+    trusted: bool, boundary: str, immediate: bool,
+) -> dict[str, Any]:
+    from ..components.kinds import Boundary
+    from ..components.resolver import ComponentResolver, ComponentSpec
+    from ..exceptions import ComponentLocked, ComponentSpecError
+
+    try:
+        moment = Boundary(str(boundary))
+    except ValueError:
+        raise ComponentSpecError("slot", f"boundary must be 'episode' or 'step', got {boundary!r}") from None
+    if moment is Boundary.RUN_START:
+        raise ComponentSpecError("slot", "a live run has passed run_start; use 'episode' or 'step'")
+    family, kind_id, glob, path = _route_slot(trainer, slot)
+    view = trainer._slot_view()
+    held = view.get(path) if path in view.paths() else None
+    if held is not None:
+        kind_id = kind_id or held.kind_id
+        if trainer.slots._slot_locked(path):
+            raise ComponentLocked(held.kind_id, path, "the slot is locked by COMPONENTS.LOCKED")
+        if moment.rank > held.component.mutability.rank:
+            needs = {0: "run_start", 1: "episode", 2: "step"}[held.component.mutability.rank]
+            raise ComponentLocked(
+                held.kind_id, path,
+                f"{held.component.name!r} may only change at {needs} boundaries, not {moment.value}",
+            )
+    queued_at = _utc_now()
+    if family == "optimizer":
+        block = _optimizer_block(raw)
+        trainer.optimizer_plan.request(path, block)
+        digest = ComponentSpec.parse("optimizer", {"type": str(block.get("TYPE", "optimizer")), "params": block}).hash()
+        return _queued(run_id, path, moment, digest, queued_at, immediate)
+
+    base = held.resolved.spec if held is not None else None
+    spec = ComponentSpec.parse(kind_id, raw, allow_patch=True).merged_over(base)
+    if spec.is_patch:
+        raise ComponentSpecError(kind_id, f"slot {path!r} holds no component to patch; give 'type' or 'import'")
+    resolver = ComponentResolver()
+    resolver.validate(spec, trusted=bool(trusted))      # E004/E005/E006/E007 now, nothing queued
+    canonical = spec.canonical()
+    if family == "weight":
+        trainer.request_weight_update(glob, canonical)
+    elif family == "strategy":
+        trainer.request_peer_strategy(glob, canonical)
+    elif family == "function":
+        trainer.functions.request(kind_id.split(".", 1)[1], glob, canonical)
+    else:
+        trainer.slots.request(path, canonical)
+    return _queued(run_id, path, moment, spec.hash(), queued_at, immediate)
+
+
+def _queued(run_id: str, path: str, boundary: Any, spec_hash: str, queued_at: str, immediate: bool) -> dict[str, Any]:
+    return {
+        "run_id": run_id,
+        "slot": path,
+        "boundary": boundary.value,
+        "spec_hash": spec_hash,
+        "applies_at": f"next {boundary.value} boundary",
+        "queued_at": queued_at,
+        "immediate": bool(immediate),
+    }
+
+
+_CLI_MANAGER: "RunManager | None" = None
+
+
+def set_cli_manager(manager: "RunManager | None") -> None:
+    """Make ``manager`` the one ``manager_for_cli`` returns (a server or a test sets it)."""
+    global _CLI_MANAGER
+    _CLI_MANAGER = manager
+
+
+def manager_for_cli(settings: Settings, registry: Registry | None = None) -> "RunManager":
+    """The process-wide manager if one was registered, else a fresh one over ``registry``.
+
+    A fresh manager holds no run, so ``components``/``request_*`` on it answer from the stored
+    registry or refuse with ``RunStateError``: a run another process drives cannot be changed
+    from here.
+    """
+    if _CLI_MANAGER is not None:
+        return _CLI_MANAGER
+    return RunManager(settings, registry=registry)

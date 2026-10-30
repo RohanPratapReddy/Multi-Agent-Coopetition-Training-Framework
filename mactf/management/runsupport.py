@@ -340,3 +340,24 @@ def render_run_report(out: Any, report: Mapping[str, Any]) -> None:
                   [Column("id", "ID", align="r"), Column("checkpoint_episode", "FROM", align="r"),
                    Column("started_epoch", "STARTED", align="r"),
                    Column("warnings_restored", "WARNINGS", align="r")], empty="(none)")
+
+
+def add_component_modules(settings, modules) -> None:
+    """``--component-module M``: append to ``COMPONENTS.MODULES`` for this process only.
+
+    Nothing is written to a settings file. The modules are loaded like any listed in
+    ``conf/components.yaml``, so the import surface is the operator's (document 17, 16.1.5).
+    """
+    if not modules:
+        return
+    from ..components import ensure_components_loaded
+    from ..components.known import is_dotted_name
+
+    for module in modules:
+        if not is_dotted_name(module):
+            raise CommandError.usage(f"--component-module {module!r} is not a dotted module name")
+    block = dict(settings.get("COMPONENTS") or {})
+    listed = list(block.get("MODULES", ()))
+    block["MODULES"] = [*listed, *[m for m in modules if m not in listed]]
+    settings["COMPONENTS"] = block
+    ensure_components_loaded(settings)

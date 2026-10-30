@@ -17,19 +17,19 @@ def _written(tmp_path):
     return {path.relative_to(tmp_path).as_posix() for path in startproject.write_project("demo_swarm", target_root=tmp_path)}
 
 
-def test_layout_writes_twenty_one_files_plus_gitignore(tmp_path):
+def test_layout_writes_twenty_three_files_plus_gitignore(tmp_path):
     names = _written(tmp_path)
-    assert len(startproject.LAYOUT) == 21
-    assert len(names) == 22
+    assert len(startproject.LAYOUT) == 23
+    assert len(names) == 24
     assert all(name.startswith("demo_swarm/") for name in names)
     assert "demo_swarm/.gitignore" in names
 
 
-def test_conf_holds_exactly_the_seventeen_yaml_files(tmp_path):
+def test_conf_holds_exactly_the_nineteen_yaml_files(tmp_path):
     names = _written(tmp_path)
     in_conf = {name for name in names if name.startswith("demo_swarm/conf/")}
     assert in_conf == {f"demo_swarm/conf/{entry.filename}" for entry in CONF_LAYOUT}
-    assert len(in_conf) == 17
+    assert len(in_conf) == 19
     assert all(name.endswith(".yaml") for name in in_conf)
 
 

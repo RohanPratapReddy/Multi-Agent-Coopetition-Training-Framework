@@ -13,15 +13,26 @@ Resolution order, later winning:
 from __future__ import annotations
 
 import copy
+import difflib
 import importlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+from .components.known import (
+    BUILTIN_NAMES,
+    LOCKABLE_KINDS,
+    component_ref_problem,
+    is_dotted_name,
+    lock_pattern_problem,
+)
 from .distill.config import DISTILLATION_DEFAULTS, validate_block
 from .exceptions import ImproperlyConfigured
+
+log = logging.getLogger("mactf.conf")
 
 ENV_SETTINGS_MODULE = "MACTF_SETTINGS_MODULE"
 #: ``MACTF_*`` variables that configure the CLI or the loader, never a settings key.
@@ -45,6 +56,30 @@ TRAINER_DEFAULTS: dict[str, Any] = {
     "HIERARCHY": False,
     "PEER_STRATEGY": "kappa_softmax",
     "WEIGHT_UPDATE": "kappa_softmax",
+    # Document 17 sections 10 and 11: per-group strategies, their guards, and the freeze mode.
+    "WEIGHT_UPDATE_OVERRIDES": {},
+    "WEIGHT_GUARD": {"MODE": "repair", "SCOPE": "custom", "TOLERANCE": 1e-6, "PROBE": True},
+    "WEIGHT_OPTIONS": {"STRICT_GLOBS": True, "MIGRATE": "reset"},
+    "AGGREGATOR": None,
+    "PEER_STRATEGY_OVERRIDES": {},
+    "PEER_STRATEGY_OPTIONS": {"STRICT_GLOBS": True, "MIGRATE": "reset"},
+    "STRATEGY_GUARD": {"MODE": "skip", "SCOPE": "custom", "PROBE": True, "CHECK_FROZEN": True},
+    "FREEZE_MODE": "legacy",
+    # Document 17 section 12: tree mutation is off until ``ENABLED`` is true. Every key is listed so
+    # that ``--set TRAINER.MUTATION.<KEY>=...`` can address it (a key outside the defaults is a typo).
+    "MUTATION": {
+        "ENABLED": False,
+        "ALLOW_PURGE": True,
+        "TOMBSTONE": "run",
+        "WATCHDOG_PRUNE": "purge",
+        "STRICT_REPLAY": True,
+        "JOURNAL_WARN": 1000,
+        "MAX_OPS_PER_PLAN": 64,
+        "MAX_PLANS_PER_EPOCH": 4,
+        "MIN_ACTIVE_ROOTS": None,       # None: min(2, roots at build)
+        "PROTECTED": [],
+        "SCHEDULE": [],
+    },
     "SHARING": "independent",
     # The task.
     "TASK": "synthetic_classification",
@@ -70,6 +105,12 @@ OPTIMIZER_DEFAULTS: dict[str, Any] = {
     # class and a mapping cannot be validated without importing torch.
     "SCHEDULER": None,
     "SCHEDULER_KWARGS": {},
+    # Document 17 section 9.4: per-node blocks and the plan's own switches. ``TYPE`` also
+    # accepts any registered optimizer name; the plan checks the name, not this module.
+    "OVERRIDES": {},
+    "MIGRATE": "reset",
+    "VERIFY": "custom",
+    "STRICT_GLOBS": True,
 }
 
 LOSS_DEFAULTS: dict[str, Any] = {
@@ -166,6 +207,12 @@ ORCHESTRATOR_DEFAULTS: dict[str, Any] = {
     "ANNOUNCE": True,
     # Validated but not read: see document 15 section 7.3.
     "PAUSE_IS_FATAL": False,
+    # Document 17 section 13: which class runs the epochs ("orchestrator" or "trainer").
+    "ENGINE": "orchestrator",
+    # Document 17 section 13.8: reproduce the orchestrator's cumulative signal window.
+    "ENGINE_COMPAT": True,
+    # Allow ``--resume`` to continue a checkpoint written by the other engine (E091).
+    "ALLOW_ENGINE_SWITCH": False,
 }
 
 CORS_DEFAULTS: dict[str, Any] = {
@@ -173,6 +220,55 @@ CORS_DEFAULTS: dict[str, Any] = {
     "ALLOW_CREDENTIALS": False,
     "ALLOW_HEADERS": ["authorization", "content-type", "x-request-id"],
     "MAX_AGE": 600,
+}
+
+# Document 17 section 15.1: the component registry's own policy. Every value is the one
+# that makes a project that writes nothing behave as it always has: no override, no lock,
+# legacy writes tolerated (with a warning), no import from an untrusted surface, ``auto``
+# discovery (which finds the framework's own entry-point group, empty), nothing imported,
+# registries left open, and a restore difference reported as a warning.
+COMPONENTS_DEFAULTS: dict[str, Any] = {
+    # -- who may replace a built-in ------------------------------------------------
+    "ALLOW_BUILTIN_OVERRIDE": False,
+    # -- what may not change at all (``kind:name`` or ``slot:<path>``, fnmatch) -----
+    "LOCKED": [],
+    # -- whether an old-style direct dict write is an error or just noise ----------
+    "STRICT_LEGACY": False,
+    # -- importing code named by a spec -------------------------------------------
+    "ALLOW_IMPORT": False,
+    "IMPORT_ALLOWLIST": [],
+    # -- how many components of one kind may exist --------------------------------
+    "MAX_PER_KIND": 512,
+    # -- discovery ----------------------------------------------------------------
+    "PLUGINS": "auto",  # "auto" | "off" | [entry-point names]
+    "MODULES": [],  # dotted modules imported once, in order
+    "FREEZE_AFTER_LOAD": False,
+    # -- restore ---------------------------------------------------------------
+    "STRICT_RESTORE": False,
+}
+
+# Document 17 section 6.6: the floor every customization is held to, and what happens when a
+# scoring stage breaks it. The defaults are inert: 1.0 equals ``SCORING.DEFAULT_LAMBDA`` and
+# every built-in lambda of a non-offsettable rule is >= 5.
+COMPLIANCE_DEFAULTS: dict[str, Any] = {
+    "MIN_FLOOR_LAMBDA": 1.0,  # lambda floor for every non-offsettable rule; > 0
+    "GUARD_MODE": "enforce",  # "enforce" | "fallback"  (6.4.2)
+    "REWARD_CEILING": 10000.0,  # matches compliance.constrain's value_cap
+    "TOLERANCE": 1e-9,  # floating-point slack in guard comparisons; [0, 1e-3]
+    "TRUST_BUILTIN": True,  # skip inspection of the three built-in stage classes
+}
+
+# Document 17 section 8.5.2: the three switches of the ``RL`` block. A family name
+# (``ADVANTAGE``, ``LOSS``...) or ``OVERRIDES`` is written only when a project selects one.
+RL_DEFAULTS: dict[str, Any] = {
+    "UNCONSUMED": "error",  # "error" | "warn": a configured family nobody reads
+    "STRICT_GLOBS": True,  # an override glob that matches no node at build is an error
+    "VERIFY": "custom",  # "custom" | "all" | "off": the contract probe
+}
+
+#: Spellings kept for compatibility / readability. The value is the canonical key.
+_COMPONENTS_ALIASES: dict[str, str] = {
+    "API_ALLOW_IMPORT": "ALLOW_IMPORT",
 }
 
 #: ``TRAINER`` keys that have a ``TRAINING`` counterpart. Folded at load.
@@ -196,6 +292,7 @@ DEFAULTS: dict[str, Any] = {
         "mactf.contrib.coopetition",
         "mactf.contrib.sandbox",
         "mactf.contrib.telemetry",
+        "mactf.contrib.components",
     ],
     "PEERS": [],
     # Document 12 section 14.1: the HTTP transport layer.
@@ -229,6 +326,12 @@ DEFAULTS: dict[str, Any] = {
     },
     # Document 15 section 5.10: the richer CORS form; ``API.CORS_ORIGINS`` stays.
     "CORS": copy.deepcopy(CORS_DEFAULTS),
+    # Document 17 section 15.1: the component registry's own policy.
+    "COMPONENTS": copy.deepcopy(COMPONENTS_DEFAULTS),
+    # Document 17 section 6.6: the compliance floor every custom scorer is held to.
+    "COMPLIANCE": copy.deepcopy(COMPLIANCE_DEFAULTS),
+    # Document 17 section 8.5: RL function defaults and per-node overrides. Empty changes nothing.
+    "RL": copy.deepcopy(RL_DEFAULTS),
     # Document 05 section 8: read only when ``mactf.distributed`` is installed.
     "DISTRIBUTED": {
         "COORDINATOR_URL": "http://127.0.0.1:8000",
@@ -464,7 +567,14 @@ def _coerce(value: str) -> Any:
         try:
             return json.loads(value)
         except json.JSONDecodeError:
-            return value
+            # ``{"team-*": independent}`` is YAML flow style, not JSON (document 17 15.9.2)
+            try:
+                import yaml
+
+                loaded = yaml.safe_load(value)
+            except Exception:  # noqa: BLE001 - not YAML either: keep the text
+                return value
+            return loaded if isinstance(loaded, (dict, list)) else value
     return value
 
 
@@ -585,14 +695,121 @@ def _coerce_env(name: str, raw: str, current: Any) -> Any:
     return _coerce(raw)                              # current is None or a list: guess
 
 
+#: ``MACTF_A__B__C__D`` is the deepest form the documented blocks need
+#: (``TRAINER.WEIGHT_UPDATE.params.alpha`` is four). A fifth segment is a typo.
+_MAX_ENV_SEGMENTS = 4
+
+
+def _close(word: str, candidates: Sequence[str]) -> str:
+    """``"; did you mean X?"`` for a typo in a variable name, or the empty string."""
+    close = difflib.get_close_matches(word, list(candidates), n=3, cutoff=0.6)
+    return f"; did you mean {', '.join(close)}?" if close else ""
+
+
+def _env_segments(key: str) -> tuple[str, ...]:
+    """``MACTF_TRAINER__MUTATION__ENABLED`` -> ``("TRAINER", "MUTATION", "ENABLED")``."""
+    return tuple(part.strip() for part in key[len("MACTF_") :].split("__"))
+
+
 def _apply_env(values: dict[str, Any]) -> None:
-    for key, raw in os.environ.items():
+    """Apply ``MACTF_*`` variables: flat scalars and ``__``-separated block leaves.
+
+    Document 15 section 14 non-goal 2 said this walks scalars only. Document 17 section 15.6
+    amends it, because a component spec is a mapping and a mapping is what every block a
+    project tunes has become. Nothing changes for a variable without ``__``.
+    """
+    from .conf_overrides import _promotion, is_open_container, is_spec_slot
+
+    for key in sorted(os.environ):                  # deterministic, so a note is stable
         if not key.startswith("MACTF_") or key in _ENV_NON_SETTINGS:
             continue
-        name = key[len("MACTF_") :]
-        if name not in values or isinstance(values[name], dict):
+        segments = _env_segments(key)
+        raw = os.environ[key]
+        if not segments[0]:
+            raise ImproperlyConfigured(f"E018: {key} names no setting")
+
+        first = segments[0]
+        if len(segments) == 1 and (first not in values or first.startswith("_")):
+            # A flat variable that names no setting has always been ignored (MACTF_HOME,
+            # MACTF_CONFIG_DIR, ...): only the ``__`` form promises a settings key.
             continue
-        values[name] = _coerce_env(name, raw, values[name])
+        if first not in values or first.startswith("_"):
+            raise ImproperlyConfigured(
+                f"E018: {key}: unknown setting {first!r}"
+                + _close(first, [name for name in values if not name.startswith("_")])
+            )
+        if len(segments) == 1:
+            if isinstance(values[first], dict):
+                raise ImproperlyConfigured(
+                    f"E018: {key} sets {first}, which is a mapping; override one key "
+                    f"instead: {key}__<KEY>"
+                )
+            values[first] = _coerce_env(first, raw, values[first])
+            continue
+
+        if len(segments) > _MAX_ENV_SEGMENTS:
+            raise ImproperlyConfigured(
+                f"E018: {key} has {len(segments)} segments; at most {_MAX_ENV_SEGMENTS} "
+                "are supported (BLOCK__KEY__SUB__LEAF)"
+            )
+        if any(not segment for segment in segments):
+            raise ImproperlyConfigured(f"E018: {key} has an empty segment")
+
+        container: Any = values
+        walked: list[str] = []
+        in_spec = False                 # below a component spec: keys are the spec's own (lower case)
+        for index, segment in enumerate(segments[:-1]):
+            if not isinstance(container, dict):
+                raise ImproperlyConfigured(
+                    f"E018: {key}: {'.'.join(walked)} is not a mapping"
+                )
+            if in_spec and segment not in container:
+                segment = segment.lower()
+            if segment not in container:
+                if not (in_spec or is_open_container(DEFAULTS, walked)):
+                    raise ImproperlyConfigured(
+                        f"E018: {key}: {'.'.join(walked) or 'settings'} has no key "
+                        f"{segment!r}{_close(segment, list(container))}"
+                    )
+                container[segment] = {}
+                if not in_spec:
+                    # Created rather than declared: worth one line, because the value is now
+                    # in the settings and not in any file the reader can grep.
+                    log.warning(
+                        "W007 %s creates %s.%s, which no default declares",
+                        key, ".".join(walked), segment,
+                    )
+            child = container[segment]
+            walked.append(segment)
+            if not isinstance(child, dict) and is_spec_slot(walked) and isinstance(child, (str, type(None))):
+                promoted = _promotion([part.lower() for part in segments[index + 1 :]])
+                if promoted is not None:
+                    container[segment] = child = promoted
+            if not isinstance(child, dict):
+                raise ImproperlyConfigured(
+                    f"E018: {key}: {'.'.join(walked)} is a {type(child).__name__}, not a "
+                    "mapping; set it whole or use a key of the mapping"
+                )
+            in_spec = in_spec or is_spec_slot(walked)
+            container = child
+
+        last = segments[-1]
+        if in_spec and last not in container:
+            last = last.lower()
+        if last not in container:
+            if not (in_spec or is_open_container(DEFAULTS, walked)):
+                raise ImproperlyConfigured(
+                    f"E018: {key}: {'.'.join(walked)} has no key {last!r}"
+                    f"{_close(last, list(container))}"
+                )
+            if not in_spec:
+                log.warning(
+                    "W007 %s creates %s.%s, which no default declares",
+                    key, ".".join(walked), last,
+                )
+            container[last] = _coerce(raw)
+            continue
+        container[last] = _coerce_env("__".join((*walked, last)), raw, container[last])
 
 
 def validate_settings(settings: Settings) -> None:
@@ -676,6 +893,9 @@ def validate_settings(settings: Settings) -> None:
             f"SCORING.NON_OFFSETTABLE must include {sorted(missing)}"
         )
 
+    # Document 17 section 6.6: the floor every customization is held to. Before
+    # _validate_points, because PENALTY_LAMBDAS is what it reads.
+    _validate_compliance(settings)
     _validate_points(settings)
     _validate_http(settings)
     # Document 14 section 10.4: the same validator the ``distillation=`` argument runs.
@@ -704,27 +924,561 @@ _SHARING_MODES = ("independent", "shared_trunk", "tied_weights")
 #: Mirror ``coopetition.strategy.PEER_STRATEGIES`` and ``coopetition.weights.WEIGHT_STRATEGIES``
 #: for the same reason: those modules import torch, and every command loads settings
 #: (document 16, section 7.9). ``tests/cli/test_conf_mirrors.py`` keeps them equal.
-_PEER_STRATEGY_NAMES = frozenset({
-    "independent", "cooperative", "kappa_softmax", "frozen_peer", "hierarchical",
-})
-_WEIGHT_STRATEGY_NAMES = frozenset({
-    "kappa_softmax", "uniform", "score_weighted", "reference_only", "none", "explicit",
-})
+#: They are views of ``components.known.BUILTIN_NAMES`` (document 17 section 15.4), not a
+#: second copy of the names.
+_PEER_STRATEGY_NAMES = BUILTIN_NAMES["peer_strategy"]
+_WEIGHT_STRATEGY_NAMES = BUILTIN_NAMES["weight_update"]
 
 _NEW_BLOCKS = (
     "TRAINER", "OPTIMIZER", "LOSS", "LOGGER", "WATCHDOG", "CHECKPOINT",
     "ORCHESTRATOR", "CORS",
+    # Document 17: the blocks its sections own.
+    "COMPONENTS", "COMPLIANCE", "RL",
 )
+
+
+def _canonical_components(block: Mapping[str, Any]) -> dict[str, Any]:
+    """Upper-case the keys and fold an alias onto its canonical key.
+
+    Two spellings that resolve to different values is a configuration the reader cannot
+    predict, so it is refused rather than resolved by order; the same value twice is
+    accepted with ``W006`` so a project can migrate one line at a time.
+    """
+    folded: dict[str, Any] = {}
+    seen: dict[str, str] = {}
+    for raw_key, value in dict(block or {}).items():
+        key = str(raw_key).upper()
+        canonical = _COMPONENTS_ALIASES.get(key, key)
+        if canonical in folded:
+            if folded[canonical] != value:
+                raise ImproperlyConfigured(
+                    f"E013: COMPONENTS.{key} and COMPONENTS.{seen[canonical]} both set "
+                    f"{canonical} to different values ({value!r} vs {folded[canonical]!r})"
+                )
+            log.warning(
+                "W006 COMPONENTS.%s is an alias of COMPONENTS.%s; keep one", key, canonical
+            )
+            continue
+        folded[canonical] = value
+        seen[canonical] = key
+    return folded
+
+
+_COMPONENTS_FLAGS = (
+    "ALLOW_BUILTIN_OVERRIDE", "STRICT_LEGACY", "ALLOW_IMPORT", "FREEZE_AFTER_LOAD",
+    "STRICT_RESTORE",
+)
+
+
+def _validate_components(settings: Any) -> None:
+    """Shape and enumerations of ``COMPONENTS`` (document 17 section 15.1). No registry, no torch.
+
+    Names that a *component reference* uses are checked by ``component_ref_problem`` at the
+    place that names them (the ``TRAINER`` branch below); this function checks the block
+    itself.
+    """
+    raw = settings.get("COMPONENTS")
+    if raw is None:
+        return
+    if not isinstance(raw, dict):
+        raise ImproperlyConfigured("E013: COMPONENTS must be a mapping")
+    block = _canonical_components(raw)
+    unknown = sorted(set(block) - set(COMPONENTS_DEFAULTS))
+    if unknown:
+        raise ImproperlyConfigured(
+            f"E013: COMPONENTS has unknown key(s) {unknown}; accepted: "
+            + ", ".join(sorted(COMPONENTS_DEFAULTS))
+        )
+    for key in _COMPONENTS_FLAGS:
+        value = block.get(key, COMPONENTS_DEFAULTS[key])
+        if not isinstance(value, bool):
+            raise ImproperlyConfigured(
+                f"E013: COMPONENTS.{key} must be true or false, got {value!r}"
+            )
+
+    maximum = block.get("MAX_PER_KIND", COMPONENTS_DEFAULTS["MAX_PER_KIND"])
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
+        raise ImproperlyConfigured(
+            f"E013: COMPONENTS.MAX_PER_KIND must be an integer >= 1, got {maximum!r}"
+        )
+
+    modules = block.get("MODULES", [])
+    if not isinstance(modules, (list, tuple)):
+        raise ImproperlyConfigured(
+            f"E013: COMPONENTS.MODULES must be a list of dotted module names, got "
+            f"{type(modules).__name__}"
+        )
+    for entry in modules:
+        # A path would be imported from the working directory, which is how a typo
+        # becomes "it works on my machine". The message names the two usual mistakes.
+        if not is_dotted_name(entry):
+            raise ImproperlyConfigured(
+                f"E014: COMPONENTS.MODULES entry {entry!r} is not a dotted module name; "
+                "write 'myproject.components' and put its parent on --pythonpath"
+            )
+
+    plugins = block.get("PLUGINS", COMPONENTS_DEFAULTS["PLUGINS"])
+    if isinstance(plugins, (list, tuple)):
+        bad = [name for name in plugins if not isinstance(name, str) or not name.strip()]
+        if bad:
+            raise ImproperlyConfigured(
+                f"E015: COMPONENTS.PLUGINS names must be non-empty strings, got {bad!r}"
+            )
+    elif str(plugins).lower() not in {"auto", "off"}:
+        raise ImproperlyConfigured(
+            "E015: COMPONENTS.PLUGINS must be 'auto', 'off' or a list of entry-point names, "
+            f"got {plugins!r}"
+        )
+
+    locked = block.get("LOCKED", [])
+    if not isinstance(locked, (list, tuple)):
+        raise ImproperlyConfigured(
+            f"E013: COMPONENTS.LOCKED must be a list of patterns, got {type(locked).__name__}"
+        )
+    for pattern in locked:
+        problem = lock_pattern_problem(pattern, kinds=LOCKABLE_KINDS)
+        if problem is not None:
+            raise ImproperlyConfigured(f"E016: {problem}")
+
+    allowlist = block.get("IMPORT_ALLOWLIST", [])
+    if not isinstance(allowlist, (list, tuple)):
+        raise ImproperlyConfigured(
+            f"E013: COMPONENTS.IMPORT_ALLOWLIST must be a list of module patterns, got "
+            f"{type(allowlist).__name__}"
+        )
+    for pattern in allowlist:
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ImproperlyConfigured(
+                f"E017: COMPONENTS.IMPORT_ALLOWLIST entry {pattern!r} is not a pattern"
+            )
+        if pattern in {"*", "**"}:
+            # A blanket allow-list would make ALLOW_IMPORT meaningless on the one
+            # surface it protects. Refused rather than documented as a footgun.
+            raise ImproperlyConfigured(
+                f"E017: COMPONENTS.IMPORT_ALLOWLIST cannot be {pattern!r}: it would admit "
+                "every module an HTTP request names; list the packages instead"
+            )
+
+
+def _validate_compliance(settings: Any) -> None:
+    """Document 17 section 6.6 (H2): the ``COMPLIANCE`` block, and the floor it implies."""
+    raw = settings.get("COMPLIANCE") or {}
+    if not isinstance(raw, Mapping):
+        raise ImproperlyConfigured("COMPLIANCE must be a mapping")
+    block = dict(raw)
+    unknown = sorted(set(block) - set(COMPLIANCE_DEFAULTS))
+    if unknown:
+        raise ImproperlyConfigured(
+            f"COMPLIANCE has unknown key(s) {unknown}; accepted: "
+            + ", ".join(sorted(COMPLIANCE_DEFAULTS))
+        )
+    mode = str(block.get("GUARD_MODE", "enforce")).lower()
+    if mode not in {"enforce", "fallback"}:
+        raise ImproperlyConfigured("COMPLIANCE.GUARD_MODE must be 'enforce' or 'fallback'")
+    # (key, default, lowest allowed, highest allowed, lowest is inclusive)
+    for key, default_value, low, high, inclusive in (
+        ("MIN_FLOOR_LAMBDA", 1.0, 0.0, math.inf, False),  # a zero floor would erase a penalty
+        ("REWARD_CEILING", 1e4, 0.0, math.inf, False),
+        ("TOLERANCE", 1e-9, 0.0, 1e-3, True),
+    ):
+        try:
+            value = float(block.get(key, default_value))
+        except (TypeError, ValueError):
+            raise ImproperlyConfigured(f"COMPLIANCE.{key} must be a number") from None
+        too_low = value < low if inclusive else value <= low
+        if not math.isfinite(value) or too_low or value > high:
+            raise ImproperlyConfigured(f"COMPLIANCE.{key} is out of range: {value!r}")
+    if not isinstance(block.get("TRUST_BUILTIN", True), bool):
+        raise ImproperlyConfigured("COMPLIANCE.TRUST_BUILTIN must be true or false")
+    scoring = settings["SCORING"]
+    floor = float(block.get("MIN_FLOOR_LAMBDA", 1.0))
+    lambdas = dict(scoring.get("PENALTY_LAMBDAS") or {})
+    default = float(scoring.get("DEFAULT_LAMBDA", 1.0))
+    reserved = {"P1", "P2", "P17", "P20", "P21", "P22"}
+    for rule_id in sorted(set(scoring["NON_OFFSETTABLE"]) | reserved):
+        try:
+            effective = float(lambdas.get(rule_id, default))
+        except (TypeError, ValueError):
+            raise ImproperlyConfigured(
+                f"SCORING.PENALTY_LAMBDAS.{rule_id} is not a number: {lambdas.get(rule_id)!r}"
+            ) from None
+        if effective < floor:
+            raise ImproperlyConfigured(
+                f"SCORING.PENALTY_LAMBDAS.{rule_id} is {effective:g}, below "
+                f"COMPLIANCE.MIN_FLOOR_LAMBDA {floor:g}; a non-offsettable floor cannot be weakened"
+            )
+
+
+_RL_RESERVED = frozenset({"OVERRIDES", "UNCONSUMED", "STRICT_GLOBS", "VERIFY", "MIGRATE"})
+
+
+def _spec_shape_problem(raw: Any) -> str | None:
+    """``None`` if ``raw`` can be a component spec, else why not. Names are not checked here."""
+    if raw is None or isinstance(raw, str):
+        return None if raw is None or raw.strip() else "an empty string is not a type name"
+    if not isinstance(raw, dict):
+        return f"a spec is a string or a mapping, not {type(raw).__name__}"
+    has_type, has_import = "type" in raw, "import" in raw
+    if has_type == has_import:
+        return "a spec needs exactly one of 'type' and 'import'"
+    params = raw.get("params")
+    if params is not None and not isinstance(params, dict):
+        return "'params' must be a mapping"
+    return None
+
+
+_SCORING_STAGE_KINDS = ("warning", "reward", "penalty")
+
+
+def _validate_scoring_stages(settings: Any) -> None:
+    """``SCORING.STAGES`` (document 17 section 6.2): a mapping of stage kind to a spec.
+
+    Shape only: whether a name is registered is decided at build, when a plugin that
+    registers it may have loaded.
+    """
+    scoring = settings.get("SCORING")
+    stages = scoring.get("STAGES") if isinstance(scoring, dict) else None
+    if stages is None:
+        return
+    if not isinstance(stages, dict):
+        raise ImproperlyConfigured("SCORING.STAGES must map a stage kind to a component spec")
+    unknown = sorted(str(kind) for kind in stages if str(kind) not in _SCORING_STAGE_KINDS)
+    if unknown:
+        raise ImproperlyConfigured(
+            f"SCORING.STAGES has unknown kind(s) {unknown}; per-node stages are "
+            f"{list(_SCORING_STAGE_KINDS)}"
+        )
+    for kind, raw in stages.items():
+        problem = _spec_shape_problem(raw)
+        if problem is not None:
+            raise ImproperlyConfigured(f"SCORING.STAGES.{kind}: {problem}")
+
+
+def _validate_rl(settings: Any) -> None:
+    block = settings.get("RL")
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise ImproperlyConfigured("RL must be a mapping")
+    from .components.kinds import RL_FAMILIES
+
+    families = {name.upper(): name for name in RL_FAMILIES}
+    unknown = sorted(
+        str(key) for key in block
+        if str(key).upper() not in _RL_RESERVED and str(key).upper() not in families
+    )
+    if unknown:
+        raise ImproperlyConfigured(
+            f"RL has unknown key(s) {unknown}; accepted: {sorted(_RL_RESERVED)} and {sorted(families)}"
+        )
+    if str(block.get("UNCONSUMED", "error")).lower() not in {"error", "warn"}:
+        raise ImproperlyConfigured("RL.UNCONSUMED must be 'error' or 'warn'")
+    if str(block.get("VERIFY", "custom")).lower() not in {"custom", "all", "off"}:
+        raise ImproperlyConfigured("RL.VERIFY must be 'custom', 'all' or 'off'")
+    migrate = block.get("MIGRATE")
+    if migrate is not None:
+        if not isinstance(migrate, dict):
+            raise ImproperlyConfigured("RL.MIGRATE must map FAMILY -> reset|carry|fail")
+        for family_key, mode in migrate.items():
+            if str(family_key).upper() not in families:
+                raise ImproperlyConfigured(
+                    f"RL.MIGRATE.{family_key}: unknown family; accepted: {sorted(families)}"
+                )
+            if str(mode).lower() not in {"reset", "carry", "fail"}:
+                raise ImproperlyConfigured(
+                    f"RL.MIGRATE.{family_key} must be 'reset', 'carry' or 'fail', got {mode!r}"
+                )
+    if not isinstance(block.get("STRICT_GLOBS", True), bool):
+        raise ImproperlyConfigured("RL.STRICT_GLOBS must be a boolean")
+    for key, raw in block.items():
+        if str(key).upper() in families:
+            problem = _spec_shape_problem(raw)
+            if problem is not None:
+                raise ImproperlyConfigured(f"RL.{key}: {problem}")
+    overrides = block.get("OVERRIDES")
+    if overrides is None:
+        return
+    if not isinstance(overrides, dict):
+        raise ImproperlyConfigured("RL.OVERRIDES must map FAMILY -> {glob: spec}")
+    for family_key, table in overrides.items():
+        family = str(family_key).upper()
+        if family not in families:
+            raise ImproperlyConfigured(
+                f"RL.OVERRIDES.{family_key}: unknown family; accepted: {sorted(families)}"
+            )
+        if family == "ROLLUP":
+            raise ImproperlyConfigured(
+                "E042: 'rollup' is served by one global object; RL.OVERRIDES.ROLLUP cannot target "
+                "nodes. Use RL.ROLLUP."
+            )
+        if not isinstance(table, dict):
+            raise ImproperlyConfigured(f"RL.OVERRIDES.{family_key} must map glob -> spec")
+        for glob, raw in table.items():
+            if not str(glob).strip():
+                raise ImproperlyConfigured(f"RL.OVERRIDES.{family_key}: a glob cannot be empty")
+            problem = _spec_shape_problem(raw)
+            if problem is not None:
+                raise ImproperlyConfigured(f"RL.OVERRIDES.{family_key}.{glob}: {problem}")
+
+
+def _validate_optimizer(settings: Mapping[str, Any]) -> None:
+    """Shape checks only. Whether a ``TYPE`` is registered is the plan's check (9.5): the
+    registry is not populated until components load, which is after this runs on some paths."""
+    optimizer = dict(settings.get("OPTIMIZER") or {})
+    if not optimizer:
+        return
+    _validate_optimizer_block(optimizer, "OPTIMIZER")
+    mode = str(optimizer.get("MIGRATE", "reset")).lower()
+    if mode not in {"reset", "carry", "fail"}:
+        raise ImproperlyConfigured(f"OPTIMIZER.MIGRATE must be 'reset', 'carry' or 'fail', got {mode!r}")
+    verify = str(optimizer.get("VERIFY", "custom")).lower()
+    if verify not in {"custom", "all", "off"}:
+        raise ImproperlyConfigured(f"OPTIMIZER.VERIFY must be 'custom', 'all' or 'off', got {verify!r}")
+    if not isinstance(optimizer.get("STRICT_GLOBS", True), bool):
+        raise ImproperlyConfigured("OPTIMIZER.STRICT_GLOBS must be a boolean")
+    overrides = optimizer.get("OVERRIDES") or {}
+    if not isinstance(overrides, dict):
+        raise ImproperlyConfigured("OPTIMIZER.OVERRIDES must map a node-path glob to an OPTIMIZER block")
+    for glob, block in overrides.items():
+        if not isinstance(glob, str) or not glob:
+            raise ImproperlyConfigured(f"OPTIMIZER.OVERRIDES keys must be non-empty strings, got {glob!r}")
+        if not isinstance(block, dict):
+            raise ImproperlyConfigured(f"OPTIMIZER.OVERRIDES[{glob!r}] must be a mapping")
+        if "OVERRIDES" in {str(k).upper() for k in block}:
+            raise ImproperlyConfigured(f"OPTIMIZER.OVERRIDES[{glob!r}] cannot contain OVERRIDES")
+        _validate_optimizer_block(block, f"OPTIMIZER.OVERRIDES[{glob!r}]")
+
+
+def _validate_optimizer_block(block: Mapping[str, Any], where: str) -> None:
+    upper = {str(k).upper(): v for k, v in block.items()}
+    kind = upper.get("TYPE")
+    if kind is not None and (not isinstance(kind, str) or not kind.strip()):
+        raise ImproperlyConfigured(f"{where}.TYPE must be a non-empty string, got {kind!r}")
+    lr = upper.get("LR")
+    if lr is not None and float(lr) < 0.0:
+        raise ImproperlyConfigured(f"{where}.LR must be >= 0")
+    if float(upper.get("WEIGHT_DECAY", 0.0) or 0.0) < 0.0:
+        raise ImproperlyConfigured(f"{where}.WEIGHT_DECAY must be >= 0")
+    accumulation = upper.get("GRAD_ACCUMULATION")
+    if accumulation is not None and int(accumulation) < 1:
+        raise ImproperlyConfigured(f"{where}.GRAD_ACCUMULATION must be >= 1")
+    norm = upper.get("MAX_GRAD_NORM")
+    if norm is not None and float(norm) < 0.0:
+        raise ImproperlyConfigured(f"{where}.MAX_GRAD_NORM must be >= 0")
+    params = upper.get("PARAMS")
+    if params is not None and not isinstance(params, dict):
+        raise ImproperlyConfigured(f"{where}.PARAMS must be a mapping")
+    kwargs = upper.get("SCHEDULER_KWARGS")
+    if kwargs is not None and not isinstance(kwargs, dict):
+        raise ImproperlyConfigured(f"{where}.SCHEDULER_KWARGS must be a mapping")
+
+
+_LOSS_COMPLIANCE_MODES = ("off", "require", "enforce")
+_STEP_GUARD_KEYS = frozenset({
+    "MODE", "SNAPSHOT", "MAX_CONSECUTIVE", "GRAD_NORM_CEILING", "MAX_GRAD_NORM",
+    "CHECK_PARAMS", "VOID_CLAMP", "REQUIRE_VOID_EVIDENCE",
+})
+_STEP_GUARD_MODES = ("off", "warn", "enforce", "quarantine")
+_STEP_GUARD_SNAPSHOTS = ("auto", "always", "never")
+
+
+#: Torch-free mirrors of ``weight_guard.GUARD_MODES`` / ``GUARD_SCOPES``,
+#: ``strategy`` guard modes / scopes, ``strategy_plan.MIGRATE_MODES`` and
+#: ``freeze.FREEZE_MODES`` (kept equal by ``tests/cli/test_conf_mirrors.py``).
+_WEIGHT_GUARD_MODES = ("repair", "fallback", "enforce")
+_WEIGHT_GUARD_SCOPES = ("custom", "all", "off")
+_WEIGHT_GUARD_KEYS = frozenset({"MODE", "SCOPE", "TOLERANCE", "PROBE"})
+_STRATEGY_GUARD_MODES = ("skip", "fallback", "enforce")
+_STRATEGY_GUARD_SCOPES = ("custom", "all", "off")
+_STRATEGY_GUARD_KEYS = frozenset({"MODE", "SCOPE", "PROBE", "CHECK_FROZEN"})
+_MIGRATE_MODES = ("reset", "carry", "fail")
+_FREEZE_MODES = ("legacy", "strict")
+
+
+def _upper_keys(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {str(key).upper(): item for key, item in dict(value).items()}
+
+
+def _validate_override_map(trainer: Mapping[str, Any], key: str, kind_id: str, settings: Any) -> None:
+    overrides = trainer.get(key) or {}
+    if not isinstance(overrides, Mapping):
+        raise ImproperlyConfigured(f"TRAINER.{key} must be a mapping of glob to spec")
+    for glob, value in overrides.items():
+        if not isinstance(glob, str) or not glob or glob != glob.strip():
+            raise ImproperlyConfigured(f"TRAINER.{key}: {glob!r} is not a usable glob")
+        problem = component_ref_problem(
+            f"TRAINER.{key}[{glob!r}]", value, kind_id=kind_id, settings=settings
+        )
+        if problem is not None:
+            raise ImproperlyConfigured(problem)
+
+
+def _validate_weight_and_strategy_blocks(settings: Any) -> None:
+    """Shape of the ``TRAINER`` keys document 17 sections 10 and 11 add.
+
+    Only shapes and enumerations: accepted parameters, ``validate``, the probe, ambiguity and
+    placement are the plans', at build, because they need the tree.
+    """
+    trainer = dict(settings.get("TRAINER") or {})
+    if not trainer:
+        return
+    _validate_override_map(trainer, "WEIGHT_UPDATE_OVERRIDES", "weight_update", settings)
+    _validate_override_map(trainer, "PEER_STRATEGY_OVERRIDES", "peer_strategy", settings)
+    for key in ("WEIGHT_GUARD", "WEIGHT_OPTIONS", "STRATEGY_GUARD", "PEER_STRATEGY_OPTIONS"):
+        if not isinstance(trainer.get(key) or {}, Mapping):
+            raise ImproperlyConfigured(f"TRAINER.{key} must be a mapping")
+    aggregator = trainer.get("AGGREGATOR")
+    if aggregator is not None:
+        problem = component_ref_problem(
+            "TRAINER.AGGREGATOR", aggregator, kind_id="aggregator", settings=settings
+        )
+        if problem is not None:
+            raise ImproperlyConfigured(problem)
+    guard = _upper_keys(trainer.get("WEIGHT_GUARD") or {})
+    unknown = sorted(set(guard) - _WEIGHT_GUARD_KEYS)
+    if unknown:
+        raise ImproperlyConfigured(
+            f"E060: TRAINER.WEIGHT_GUARD has unknown keys {unknown}; accepted: {sorted(_WEIGHT_GUARD_KEYS)}"
+        )
+    if str(guard.get("MODE", "repair")).lower() not in _WEIGHT_GUARD_MODES:
+        raise ImproperlyConfigured(
+            f"E060: TRAINER.WEIGHT_GUARD.MODE must be one of {list(_WEIGHT_GUARD_MODES)}, got {guard.get('MODE')!r}"
+        )
+    if str(guard.get("SCOPE", "custom")).lower() not in _WEIGHT_GUARD_SCOPES:
+        raise ImproperlyConfigured(
+            f"E060: TRAINER.WEIGHT_GUARD.SCOPE must be one of {list(_WEIGHT_GUARD_SCOPES)}, got {guard.get('SCOPE')!r}"
+        )
+    tolerance = guard.get("TOLERANCE", 1e-6)
+    if isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or not 0.0 < tolerance < 0.1:
+        raise ImproperlyConfigured(f"E060: TRAINER.WEIGHT_GUARD.TOLERANCE must be in (0, 0.1), got {tolerance!r}")
+    options = _upper_keys(trainer.get("WEIGHT_OPTIONS") or {})
+    unknown = sorted(set(options) - {"STRICT_GLOBS", "MIGRATE"})
+    if unknown:
+        raise ImproperlyConfigured(
+            f"E060: TRAINER.WEIGHT_OPTIONS has unknown keys {unknown}; accepted: MIGRATE, STRICT_GLOBS"
+        )
+    if str(options.get("MIGRATE", "reset")).lower() not in _MIGRATE_MODES:
+        raise ImproperlyConfigured(
+            f"E060: TRAINER.WEIGHT_OPTIONS.MIGRATE must be one of {list(_MIGRATE_MODES)}, got {options.get('MIGRATE')!r}"
+        )
+    sguard = _upper_keys(trainer.get("STRATEGY_GUARD") or {})
+    unknown = sorted(set(sguard) - _STRATEGY_GUARD_KEYS)
+    if unknown:
+        raise ImproperlyConfigured(
+            f"E070: TRAINER.STRATEGY_GUARD has unknown keys {unknown}; accepted: {sorted(_STRATEGY_GUARD_KEYS)}"
+        )
+    if str(sguard.get("MODE", "skip")).lower() not in _STRATEGY_GUARD_MODES:
+        raise ImproperlyConfigured(
+            f"E070: TRAINER.STRATEGY_GUARD.MODE must be one of {list(_STRATEGY_GUARD_MODES)}, got {sguard.get('MODE')!r}"
+        )
+    if str(sguard.get("SCOPE", "custom")).lower() not in _STRATEGY_GUARD_SCOPES:
+        raise ImproperlyConfigured(
+            f"E070: TRAINER.STRATEGY_GUARD.SCOPE must be one of {list(_STRATEGY_GUARD_SCOPES)}, got {sguard.get('SCOPE')!r}"
+        )
+    soptions = _upper_keys(trainer.get("PEER_STRATEGY_OPTIONS") or {})
+    unknown = sorted(set(soptions) - {"STRICT_GLOBS", "MIGRATE"})
+    if unknown:
+        raise ImproperlyConfigured(
+            f"E070: TRAINER.PEER_STRATEGY_OPTIONS has unknown keys {unknown}; accepted: MIGRATE, STRICT_GLOBS"
+        )
+    if str(soptions.get("MIGRATE", "reset")).lower() not in _MIGRATE_MODES:
+        raise ImproperlyConfigured(
+            f"E070: TRAINER.PEER_STRATEGY_OPTIONS.MIGRATE must be one of {list(_MIGRATE_MODES)}, "
+            f"got {soptions.get('MIGRATE')!r}"
+        )
+    if str(trainer.get("FREEZE_MODE", "legacy")).lower() not in _FREEZE_MODES:
+        raise ImproperlyConfigured(
+            f"E070: TRAINER.FREEZE_MODE must be one of {list(_FREEZE_MODES)}, got {trainer.get('FREEZE_MODE')!r}"
+        )
+    kappa = dict(settings.get("COOPETITION") or {}).get("KAPPA_OVERRIDES")
+    if kappa is not None and not isinstance(kappa, Mapping):
+        raise ImproperlyConfigured("E062: COOPETITION.KAPPA_OVERRIDES must be a mapping of glob to block")
+
+
+def _validate_trainer_policy(settings: Any) -> None:
+    """Shape of the ``TRAINER`` keys document 17 section 7 adds. Names are checked at build."""
+    trainer = dict(settings.get("TRAINER") or {})
+    if not trainer:
+        return
+    policy = trainer.get("POLICY")
+    if policy not in (None, "", {}):
+        problem = component_ref_problem(
+            "TRAINER.POLICY", policy, kind_id="trainer_policy", settings=settings
+        )
+        if problem is not None:
+            raise ImproperlyConfigured(problem)
+    if "ALLOW_UNSAFE_POLICY" in trainer and not isinstance(trainer["ALLOW_UNSAFE_POLICY"], bool):
+        raise ImproperlyConfigured("TRAINER.ALLOW_UNSAFE_POLICY must be a boolean")
+    mode = str(trainer.get("LOSS_COMPLIANCE", "require")).lower()
+    if mode not in _LOSS_COMPLIANCE_MODES:
+        raise ImproperlyConfigured(
+            f"TRAINER.LOSS_COMPLIANCE must be one of {list(_LOSS_COMPLIANCE_MODES)}, got {mode!r}"
+        )
+    coefficient = trainer.get("COMPLIANCE_COEFFICIENT", 1.0)
+    if isinstance(coefficient, bool) or not isinstance(coefficient, (int, float)) or coefficient < 0:
+        raise ImproperlyConfigured("TRAINER.COMPLIANCE_COEFFICIENT must be a number >= 0")
+    guard = trainer.get("STEP_GUARD")
+    if guard is None:
+        return
+    if not isinstance(guard, dict):
+        raise ImproperlyConfigured("TRAINER.STEP_GUARD must be a mapping")
+    data = {str(key).upper(): value for key, value in guard.items()}
+    unknown = sorted(set(data) - _STEP_GUARD_KEYS)
+    if unknown:
+        raise ImproperlyConfigured(
+            "unknown TRAINER.STEP_GUARD key(s): " + ", ".join(unknown)
+            + "; accepted: " + ", ".join(sorted(_STEP_GUARD_KEYS))
+        )
+    if "MODE" in data and str(data["MODE"]).lower() not in _STEP_GUARD_MODES:
+        raise ImproperlyConfigured(
+            f"TRAINER.STEP_GUARD.MODE must be one of {list(_STEP_GUARD_MODES)}, got {data['MODE']!r}"
+        )
+    if "SNAPSHOT" in data and str(data["SNAPSHOT"]).lower() not in _STEP_GUARD_SNAPSHOTS:
+        raise ImproperlyConfigured(
+            f"TRAINER.STEP_GUARD.SNAPSHOT must be one of {list(_STEP_GUARD_SNAPSHOTS)}, "
+            f"got {data['SNAPSHOT']!r}"
+        )
+    if "MAX_CONSECUTIVE" in data and int(data["MAX_CONSECUTIVE"]) < 1:
+        raise ImproperlyConfigured("TRAINER.STEP_GUARD.MAX_CONSECUTIVE must be >= 1")
+    if "GRAD_NORM_CEILING" in data and not float(data["GRAD_NORM_CEILING"]) > 0.0:
+        raise ImproperlyConfigured("TRAINER.STEP_GUARD.GRAD_NORM_CEILING must be > 0")
+    if data.get("MAX_GRAD_NORM") is not None and not float(data["MAX_GRAD_NORM"]) > 0.0:
+        raise ImproperlyConfigured("TRAINER.STEP_GUARD.MAX_GRAD_NORM must be > 0 when set")
+
+
+def _validate_mutation_block(settings: Any) -> None:
+    """Shape and enumerations of ``TRAINER.MUTATION`` (document 17 section 12.10).
+
+    ``MutationLimits.validate_block`` is the one validator, so the configuration and the trainer
+    cannot drift. ``mactf.training.mutation`` imports ``mactf.exceptions`` and
+    ``mactf.coopetition.tree`` only, both torch-free, so this check is safe in the load path
+    every command pays for.
+    """
+    trainer = dict(settings.get("TRAINER") or {})
+    block = trainer.get("MUTATION")
+    if block is None:
+        return
+    if not isinstance(block, Mapping):
+        raise ImproperlyConfigured("TRAINER.MUTATION must be a mapping")
+    from .training.mutation import MutationLimits
+
+    clean = MutationLimits.validate_block(block)
+    if clean.get("SCHEDULE") and not clean.get("ENABLED", False):
+        # A schedule is meaningless without the engine that reads it, and silently ignoring it
+        # would be the kind of dead setting section 2.2 is about.
+        raise ImproperlyConfigured(
+            "TRAINER.MUTATION.SCHEDULE is set but TRAINER.MUTATION.ENABLED is false; "
+            "the schedule would never run"
+        )
 
 
 def _validate_blocks(settings: Any) -> None:
     """Document 15 section 5.11: the blocks the ``conf/`` tree adds."""
-    PEER_STRATEGIES = _PEER_STRATEGY_NAMES
-    WEIGHT_STRATEGIES = _WEIGHT_STRATEGY_NAMES
-
     for name in _NEW_BLOCKS:
         if name in settings and not isinstance(settings[name], dict):
-            raise ImproperlyConfigured(f"{name} must be a mapping")
+            prefix = "E013: " if name == "COMPONENTS" else ""
+            raise ImproperlyConfigured(f"{prefix}{name} must be a mapping")
+    _validate_components(settings)
 
     trainer = dict(settings.get("TRAINER") or {})
     if trainer:
@@ -736,36 +1490,30 @@ def _validate_blocks(settings: Any) -> None:
             raise ImproperlyConfigured("TRAINER.STEPS_PER_EPOCH must be >= 1")
         if int(trainer.get("GRAD_ACCUMULATION", 1)) < 1:
             raise ImproperlyConfigured("TRAINER.GRAD_ACCUMULATION must be >= 1")
-        if str(trainer.get("PEER_STRATEGY", "kappa_softmax")).lower() not in PEER_STRATEGIES:
-            raise ImproperlyConfigured(
-                "TRAINER.PEER_STRATEGY must be one of " + ", ".join(sorted(PEER_STRATEGIES))
+        for where, key, kind_id in (
+            ("TRAINER.PEER_STRATEGY", "PEER_STRATEGY", "peer_strategy"),
+            ("TRAINER.WEIGHT_UPDATE", "WEIGHT_UPDATE", "weight_update"),
+        ):
+            problem = component_ref_problem(
+                where, trainer.get(key, "kappa_softmax"), kind_id=kind_id, settings=settings
             )
-        if str(trainer.get("WEIGHT_UPDATE", "kappa_softmax")).lower() not in WEIGHT_STRATEGIES:
-            raise ImproperlyConfigured(
-                "TRAINER.WEIGHT_UPDATE must be one of " + ", ".join(sorted(WEIGHT_STRATEGIES))
-            )
+            if problem is not None:
+                raise ImproperlyConfigured(problem)
         if str(trainer.get("SHARING", "independent")).lower() not in _SHARING_MODES:
             raise ImproperlyConfigured(
                 f"TRAINER.SHARING must be one of {list(_SHARING_MODES)}, "
                 f"got {trainer.get('SHARING')!r}"
             )
 
-    optimizer = dict(settings.get("OPTIMIZER") or {})
-    if optimizer:
-        kind = str(optimizer.get("TYPE", "torch")).lower()
-        if kind not in {"torch", "scipy", "callable"}:
-            raise ImproperlyConfigured(
-                f"OPTIMIZER.TYPE must be 'torch', 'scipy', or 'callable', got {kind!r}"
-            )
-        lr = optimizer.get("LR")
-        if lr is not None and float(lr) < 0.0:
-            raise ImproperlyConfigured("OPTIMIZER.LR must be >= 0")
-        if float(optimizer.get("WEIGHT_DECAY", 0.0)) < 0.0:
-            raise ImproperlyConfigured("OPTIMIZER.WEIGHT_DECAY must be >= 0")
-        if int(optimizer.get("GRAD_ACCUMULATION", 1)) < 1:
-            raise ImproperlyConfigured("OPTIMIZER.GRAD_ACCUMULATION must be >= 1")
+    _validate_optimizer(settings)
 
     _validate_learning_rate(settings)
+
+    _validate_rl(settings)
+    _validate_scoring_stages(settings)
+    _validate_trainer_policy(settings)
+    _validate_weight_and_strategy_blocks(settings)
+    _validate_mutation_block(settings)
 
     loss = dict(settings.get("LOSS") or {})
     if loss:
@@ -835,6 +1583,20 @@ def _validate_blocks(settings: Any) -> None:
 
     orchestrator = dict(settings.get("ORCHESTRATOR") or {})
     if orchestrator:
+        from .orchestration.dispatch import ENGINES  # torch-free, so settings stay torch-free
+
+        raw_engine = orchestrator.get("ENGINE")
+        engine = "orchestrator" if raw_engine is None or raw_engine == "" else str(raw_engine).strip().lower()
+        if engine not in ENGINES:
+            raise ImproperlyConfigured(
+                f"E090: ORCHESTRATOR.ENGINE must be one of {list(ENGINES)}, got "
+                f"{orchestrator.get('ENGINE')!r}"
+            )
+        for key in ("ENGINE_COMPAT", "ALLOW_ENGINE_SWITCH"):
+            if key in orchestrator and not isinstance(orchestrator[key], bool):
+                raise ImproperlyConfigured(
+                    f"ORCHESTRATOR.{key} must be true or false, got {orchestrator[key]!r}"
+                )
         epochs = orchestrator.get("MAX_EPOCHS")
         if epochs is not None and (isinstance(epochs, bool) or int(epochs) < 1):
             raise ImproperlyConfigured("ORCHESTRATOR.MAX_EPOCHS must be None or >= 1")
@@ -1241,6 +2003,12 @@ def configure(
     _settings = load_settings(module_path, overrides=overrides, config_files=config_files)
     apps_module.reset_registry()
     _clear_http_caches()
+    # Document 17 section 15.5: the registry is configured with the settings that describe
+    # it, before any consumer resolves a spec. Idempotent and torch-free unless a MODULE
+    # imports torch, which is the project's own decision.
+    from .components.plugins import ensure_components_loaded
+
+    ensure_components_loaded(_settings)
     return _settings
 
 

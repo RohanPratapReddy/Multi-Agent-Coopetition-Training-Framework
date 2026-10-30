@@ -17,7 +17,7 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from .exceptions import ImproperlyConfigured
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -231,10 +231,21 @@ def _migration_3_step(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_4_step(connection: sqlite3.Connection) -> None:
+    """The component manifest of a run (document 17 section 14).
+
+    One nullable column, no backfill: a row written before this version keeps ``NULL``, and
+    ``NULL`` means "this run predates the component model or used only built-ins". A backfill
+    would have to invent a manifest, and an invented manifest is worse than an absent one.
+    """
+    _add_columns_if_absent(connection, "runs", {"components_json": "TEXT"})
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, statements=_MIGRATION_1),
     Migration(2, step=_migration_2_step),
     Migration(3, step=_migration_3_step),
+    Migration(4, step=_migration_4_step),
 )
 
 #: Version -> migration, for callers that want to look one up.
@@ -591,7 +602,7 @@ class Registry:
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
-        return _row_to_dict(row) if row else None
+        return _decode_run(row) if row else None
 
     def list_runs(
         self,
@@ -907,6 +918,59 @@ class Registry:
                 """,
                 (run_id, episode, str(path), kappa, entropy, score, time.time()),
             )
+
+    # -- components (document 17 section 14.6) ---------------------------
+    def record_components(
+        self,
+        run_id: str,
+        components: Mapping[str, Any] | None,
+        *,
+        source: str = "engine",
+    ) -> None:
+        """Store a run's component manifest.
+
+        ``source`` is a note, not a filter: ``engine`` writes the manifest a run started with,
+        ``checkpoint`` re-writes it when a swap or a resume changed it, ``import`` is a caller
+        backfilling from a file. An empty or absent mapping stores ``NULL`` rather than ``{}``
+        so that "no components recorded" and "recorded as nothing" cannot be confused.
+        """
+        payload = json.dumps(dict(components), default=str, sort_keys=True) if components else None
+        with self.connect() as connection:
+            try:
+                cursor = connection.execute(
+                    "UPDATE runs SET components_json = ? WHERE id = ?", (payload, run_id)
+                )
+            except sqlite3.OperationalError as error:
+                if "components_json" not in str(error):
+                    raise
+                raise ImproperlyConfigured(
+                    f"the registry is at schema {self.current_version(connection)}, which has "
+                    "no component column; run `migrate` to record components"
+                ) from error
+            if not cursor.rowcount:
+                raise ImproperlyConfigured(
+                    f"no run {run_id!r} to record {source} components for; "
+                    "start_run must write the row first"
+                )
+
+    def components(self, run_id: str) -> dict[str, Any] | None:
+        """The run's manifest as stored, or ``None`` when it has none.
+
+        ``None`` is the honest answer for a run that predates the component model and for one
+        that used only built-ins; the caller that needs to tell them apart looks at the
+        checkpoint (``W053`` says the file records none either).
+        """
+        with self.connect() as connection:
+            try:
+                row = connection.execute(
+                    "SELECT components_json FROM runs WHERE id = ?", (run_id,)
+                ).fetchone()
+            except sqlite3.OperationalError:    # a schema-3 file: nothing was ever recorded
+                return None
+        if row is None:
+            return None
+        raw = row["components_json"]
+        return json.loads(raw) if raw else None
 
     def checkpoints(self, run_id: str) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -1278,6 +1342,25 @@ def _run_filter(
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {key: row[key] for key in row.keys()}
+
+
+def _decode_run(row: sqlite3.Row) -> dict[str, Any]:
+    """A ``runs`` row with the component manifest decoded and named ``components``.
+
+    ``settings``, ``runtime`` and ``sandbox`` stay JSON text: every reader of ``get_run``
+    decodes them itself today (``orchestration.runview.decode_run``, ``live.py``), and a reader
+    that calls ``json.loads`` on a mapping fails. Only the new column is decoded.
+    """
+    item = _row_to_dict(row)
+    raw = item.pop("components_json", None)
+    decoded: Any = raw
+    if isinstance(raw, str) and raw:
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:  # a hand-edited row: keep the text, do not fail
+            decoded = raw
+    item["components"] = decoded if raw else None
+    return item
 
 
 def ensure_registry(settings: Any) -> Registry:

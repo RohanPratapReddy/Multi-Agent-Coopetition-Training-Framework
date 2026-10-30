@@ -14,6 +14,7 @@ from ....http.exceptions import (
     HttpError,
     NotAuthenticated,
     RateLimited,
+    ServerError,
     ValidationError,
     register_handler,
 )
@@ -22,7 +23,23 @@ from ....http.request import Request
 from ....http.response import JsonResponse, Response
 from ....http.serializers import Serializer
 from ....http.views import View
-from ....exceptions import InvalidArgument, ResourceNotFound, SandboxUnavailable, StateConflict
+from ....exceptions import (
+    ComponentBuildError,
+    ComponentCollision,
+    ComponentContractError,
+    ComponentImportDenied,
+    ComponentLocked,
+    ComponentMigrationError,
+    ComponentMissing,
+    ComponentParamError,
+    ComponentSpecError,
+    InvalidArgument,
+    MutationError,
+    ResourceNotFound,
+    SandboxUnavailable,
+    StateConflict,
+    UnsafePolicyDenied,
+)
 from ....orchestration.runview import decode_json_columns, decode_run
 from ....orchestration.live import CapacityExceeded, RunExists, RunStateError
 from .. import deps
@@ -38,6 +55,23 @@ _SAFE = {"options"}
 def _translate(exc: BaseException) -> BaseException:
     """Core exceptions -> the HTTP exception classes the API already uses, so every
     problem document is byte-identical to what the inlined code produced."""
+    # Document 17 section 16.3.4: a component error below any view becomes the right problem.
+    if isinstance(exc, UnsafePolicyDenied):  # a ComponentLocked, but a configuration mistake (17.1.3: 422)
+        return ValidationError({"policy": [str(exc)]}, extensions={"code": exc.code})
+    if isinstance(exc, ComponentMigrationError):  # 17.1.3: 409, the old component keeps running
+        return Conflict(str(exc), extensions={"code": exc.code})
+    if isinstance(exc, ComponentBuildError):  # 17.1.3: 500 as problem+json carrying the code
+        return ServerError(str(exc), extensions={"code": exc.code})
+    if isinstance(exc, (ComponentCollision, ComponentLocked)):
+        return Conflict(str(exc), extensions={"code": exc.code, "slot": getattr(exc, "path", None) or exc.name})
+    if isinstance(exc, ComponentMissing):
+        return Http404(str(exc), extensions={"code": exc.code, "known": list(exc.known)})
+    if isinstance(exc, (ComponentParamError, ComponentSpecError, ComponentImportDenied, ComponentContractError)):
+        return ValidationError({"spec": [str(exc)]}, extensions={"code": exc.code})
+    if isinstance(exc, MutationError):
+        return ValidationError(
+            {"plan": [str(exc)]}, extensions={"code": exc.code, "findings": list(exc.findings)}
+        )
     if isinstance(exc, ResourceNotFound):
         return Http404(str(exc))
     if isinstance(exc, StateConflict):

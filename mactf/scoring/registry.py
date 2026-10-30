@@ -10,7 +10,8 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from ..exceptions import ValidationError
+from ..components.decorators import register_scorer
+from ..components.legacy import LegacyTable
 from .base import Scorer
 from .hierarchy import HierarchicalScorer
 from .penalty import PenaltyScorer
@@ -23,30 +24,19 @@ from .warning_scorer import WarningScorer
 #: API, but it is only valid as the outermost stage of a hierarchical run: it
 #: scores a whole tree, so it cannot sit in a per-node chain (document 07
 #: section 10). ``ScoringPipeline._validate_chain`` rejects it anywhere else.
-SCORER_TYPES: dict[str, type[Scorer]] = {
-    "reward": RewardScorer,
-    "penalty": PenaltyScorer,
-    "warning": WarningScorer,
-    "hierarchy": HierarchicalScorer,
-}
-
-
-def register_scorer(name: str, scorer: type[Scorer], *, replace: bool = False) -> None:
-    """Add a stage type. Applications use this to expose a custom stage.
-
-    ``replace=False`` refuses to overwrite an existing name, because a silent
-    override would make a stored spec mean something different after a deploy.
-    """
-    if not isinstance(scorer, type) or not issubclass(scorer, Scorer):
-        raise ValidationError(f"{scorer!r} is not a Scorer subclass")
-    if not name or not name.replace("_", "").isalnum():
-        raise ValidationError(f"invalid scorer type name {name!r}")
-    if name in SCORER_TYPES and not replace:
-        raise ValidationError(
-            f"scorer type {name!r} is already registered to "
-            f"{SCORER_TYPES[name].__name__}; pass replace=True to override"
-        )
-    SCORER_TYPES[name] = scorer
+#:
+#: A live view of the ``scorer`` registry of ``mactf.components`` (document 17 section 3.6):
+#: reads are plain dict reads, writes go through the registry's collision, origin and lock
+#: rules.
+SCORER_TYPES: dict[str, type[Scorer]] = LegacyTable(
+    "scorer",
+    {
+        "reward": RewardScorer,
+        "penalty": PenaltyScorer,
+        "warning": WarningScorer,
+        "hierarchy": HierarchicalScorer,
+    },
+)
 
 
 def build_scorer_from_spec(spec: Mapping[str, Any]) -> Scorer:
@@ -73,6 +63,11 @@ def scorer_capabilities() -> list[dict[str, Any]]:
         )
     return payload
 
+
+# Built-ins registered by their own modules (document 17 sections 6.3 and 6.8):
+# ``composed_reward``, ``zero_reward``, ``no_warnings`` and the ``reward_term`` kind.
+from . import null_stages as _null_stages  # noqa: E402,F401
+from . import reward_terms as _reward_terms  # noqa: E402,F401
 
 __all__ = [
     "SCORER_TYPES",

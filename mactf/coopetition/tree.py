@@ -26,7 +26,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from ..exceptions import ContractError, ValidationError
 
@@ -951,6 +951,43 @@ class PeerTree:
                 status=node.status,
             )
         return copy_tree
+
+    def adopt(self, other: "PeerTree") -> dict[str, PeerNode]:
+        """Take ``other``'s nodes as this tree's own. Returns the old mapping for ``restore``.
+
+        The old node objects are left untouched, so ``restore`` puts the tree back exactly: the
+        same objects, the same ``children`` tuples, the same statuses (document 17 section 12.5.2).
+        """
+        previous = self._nodes
+        self._nodes = other._nodes
+        return previous
+
+    def restore(self, previous: dict[str, PeerNode]) -> None:
+        """Undo :meth:`adopt`."""
+        self._nodes = previous
+
+    def without(self, paths: Iterable[str]) -> "PeerTree":
+        """A read-only view without ``paths`` and their descendants.
+
+        Kept nodes are the *same objects* (so a status read is live), except an ancestor that
+        loses a child, which is a copy with a shorter ``children`` tuple. Used for the active
+        view that rollout, scoring and strategy validation walk (document 17 section 12.7).
+        Do not add to it. Returns ``self`` when nothing is dropped.
+        """
+        dropped: set[str] = set()
+        for path in paths:
+            if path in self._nodes and path not in dropped:
+                dropped.add(path)
+                dropped.update(self.descendants(path))
+        if not dropped:
+            return self
+        view = PeerTree(max_depth=self.max_depth, max_nodes=self.max_nodes)
+        for path, node in self._nodes.items():
+            if path in dropped:
+                continue
+            kept = tuple(child for child in node.children if child not in dropped)
+            view._nodes[path] = node if kept == node.children else replace(node, children=kept)
+        return view
 
     def mark(self, path: str, status: str) -> None:
         """Set a node's status, validating the value."""

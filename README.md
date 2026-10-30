@@ -269,12 +269,24 @@ docs/              framework.md and the original .bak — never modified
 | `doctor` | Python, torch, GPU name/VRAM, QEMU, best isolation level |
 | `migrate` | Create/upgrade the run registry |
 | `run` | Training loop (`--epochs --device --seed --redteam --dry-run --resume`) |
+| `components` | List, inspect, validate, scaffold and diff pluggable training components (scorers, policies, optimizers, strategies, RL functions) |
 | `inspect` | `--runs --episodes --rules --checkpoints --json` |
 | `shell` | Python shell with settings, rules, scoring, sandbox preloaded |
 | `startproject` | Scaffold a runnable project (settings, peers, configs, manage.py) |
 | `startpeer` | Scaffold an `nn.Module` peer |
 | `sandbox` | `status`, `install`, `provision`, `launch`, `clean` |
 | `redteam` | Adversarial pass; asserts P1 voids a score and P20 hits the Ω floor |
+
+---
+
+## Customising components
+
+Every pluggable part of training is a registered *component* of a *kind*, chosen by a
+layered spec in `COMPONENTS` / `RL` settings (or `conf/components.yaml`), wrapped in
+compliance guards so a custom scorer, policy, optimizer or strategy cannot weaken the
+rules, and recorded in checkpoints so a run resumes with the parts it started with. With
+nothing configured nothing changes. See `docs/components.md` and
+`mactf components --help`.
 
 ---
 

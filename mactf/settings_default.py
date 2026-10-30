@@ -28,6 +28,7 @@ INSTALLED_APPS = [
     "mactf.contrib.coopetition",
     "mactf.contrib.sandbox",
     "mactf.contrib.telemetry",
+    "mactf.contrib.components",
 ]
 
 # No peers until a project declares them. ``check`` reports this as a warning

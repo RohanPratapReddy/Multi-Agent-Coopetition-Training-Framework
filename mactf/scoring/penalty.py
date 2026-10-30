@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from ..compliance import DEFAULT_MIN_FLOOR_LAMBDA, effective_non_offsettable
 from ..exceptions import ComplianceError, ImproperlyConfigured
 from ..rules.catalog import NON_OFFSETTABLE
 from .base import ScoreContext, Scorer, ScorerDiagnostic, ScorerOutput, ScoringKind
@@ -50,10 +51,11 @@ class PenaltyScorer(Scorer):
 
     @property
     def non_offsettable(self) -> frozenset[str]:
-        configured = self.config.get("NON_OFFSETTABLE")
-        if configured is None:
-            return NON_OFFSETTABLE
-        return frozenset(configured)
+        return effective_non_offsettable(self.config.get("NON_OFFSETTABLE"))
+
+    @property
+    def min_floor_lambda(self) -> float:
+        return float(self.config.get("MIN_FLOOR_LAMBDA", DEFAULT_MIN_FLOOR_LAMBDA))
 
     def _allowed(self, ctx: ScoreContext) -> frozenset[str] | None:
         """The rules the controlling tier admits.
@@ -72,6 +74,8 @@ class PenaltyScorer(Scorer):
         default_lambda = self.default_lambda
         allowed = self._allowed(ctx)
         warning_only = ctx.warning_only_rules
+        non_offsettable = self.non_offsettable
+        floor_lambda = self.min_floor_lambda
 
         amounts: dict[str, float] = {}
         excluded: list[str] = []
@@ -89,6 +93,8 @@ class PenaltyScorer(Scorer):
                 excluded.append(event.rule_id)
                 continue
             lam = float(lambdas.get(event.rule_id, default_lambda))
+            if event.rule_id in non_offsettable:
+                lam = max(lam, floor_lambda)  # H2: a floor can never be configured to zero
             amounts[event.rule_id] = amounts.get(event.rule_id, 0.0) + lam * event.magnitude
 
         omega, omega_rules = self._omega(amounts)
@@ -178,6 +184,55 @@ class PenaltyScorer(Scorer):
                     level="error",
                     code="penalties.non_numeric_omega",
                     message=f"SANDBOX_MULTIPLIER is not numeric: {multiplier!r}",
+                )
+            )
+
+        configured = settings.get("NON_OFFSETTABLE", self.config.get("NON_OFFSETTABLE"))
+        if configured is not None:
+            narrowed = sorted(NON_OFFSETTABLE - frozenset(configured))
+            if narrowed:
+                diagnostics.append(
+                    ScorerDiagnostic(
+                        level="error",
+                        code="penalties.non_offsettable_narrowed",
+                        message=f"NON_OFFSETTABLE omits {narrowed}; it may only add rules",
+                        hint="remove the key to use the catalog set, or list a superset of it",
+                    )
+                )
+        try:
+            floor = float(
+                settings.get(
+                    "MIN_FLOOR_LAMBDA",
+                    self.config.get("MIN_FLOOR_LAMBDA", DEFAULT_MIN_FLOOR_LAMBDA),
+                )
+            )
+            default = float(settings.get("DEFAULT_LAMBDA", self.default_lambda))
+            for rule_id in sorted(effective_non_offsettable(configured)):
+                try:
+                    effective = float((raw or {}).get(rule_id, default))
+                except (TypeError, ValueError):
+                    continue  # already reported as penalties.non_numeric_lambda
+                if effective < 0.0:
+                    continue  # already reported as penalties.negative_lambda
+                if effective < floor:
+                    diagnostics.append(
+                        ScorerDiagnostic(
+                            level="error",
+                            code="penalties.floor_lambda_below_minimum",
+                            message=(
+                                f"PENALTY_LAMBDAS[{rule_id!r}] resolves to {effective:g}, below "
+                                f"MIN_FLOOR_LAMBDA {floor:g}; a non-offsettable floor cannot be "
+                                "weakened"
+                            ),
+                            hint=f"raise the lambda to at least {floor:g}",
+                        )
+                    )
+        except (TypeError, ValueError):
+            diagnostics.append(
+                ScorerDiagnostic(
+                    level="error",
+                    code="penalties.non_numeric_floor",
+                    message="MIN_FLOOR_LAMBDA or DEFAULT_LAMBDA is not numeric",
                 )
             )
         return diagnostics

@@ -1,0 +1,15 @@
+{
+  "legs": [
+    "orchestrator",
+    "trainer"
+  ],
+  "run": {
+    "action_dim": 3,
+    "batch_size": 8,
+    "epochs": 3,
+    "peers": 2,
+    "seed": 1337,
+    "state_dim": 4
+  },
+  "torch": "2.15"
+}

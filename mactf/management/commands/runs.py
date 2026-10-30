@@ -15,6 +15,7 @@ from ..exitcodes import ExitCode
 from ..group import GroupCommand, Sub
 from ..interrupt import StopFlag
 from ..output import Column, format_bytes
+from ..structured import read_structured
 from ..runsupport import (
     RUN_COLUMNS,
     RUN_OPTIONAL,
@@ -36,7 +37,7 @@ from ..runsupport import (
     target_run,
     when_arg,
 )
-from ...exceptions import CommandError, ResourceNotFound, StateConflict
+from ...exceptions import CommandError, ComponentError, ComponentMissing, ResourceNotFound, StateConflict
 from ...orchestration.recovery import (
     ACTIVE_STATUSES,
     FINAL_STATUSES,
@@ -132,6 +133,19 @@ class Command(GroupCommand):
                        (("--dry-run",), {"action": "store_true", "default": False,
                                          "help": "Say what would be deleted; delete nothing."})),
             examples=("mactf runs delete 9f3a --dry-run", "mactf runs delete --older-than 30d --yes")),
+        Sub("components", "Show or change the components a run uses.", output_formats=("text", "json", "yaml"),
+            arguments=((("action",), {"choices": ("show", "set")}),
+                       (("run_id",), {"completer": "run_id"}),
+                       (("slot",), {"nargs": "?", "default": None, "metavar": "SLOT", "completer": "slot_path",
+                                    "help": "A slot path such as TRAINER.WEIGHT_UPDATE (required for set)."}),
+                       (("--spec",), {"default": None, "metavar": "YAML",
+                                      "help": "The new spec, or a patch of params only; '-' reads standard input."}),
+                       (("--now",), {"action": "store_true", "default": False,
+                                     "help": "Fail rather than wait if the slot cannot change before the next episode."}),
+                       (("--dry-run",), {"action": "store_true", "default": False,
+                                         "help": "Check the spec and the slot; queue nothing."})),
+            examples=("mactf runs components show run-0007",
+                      "mactf runs components set run-0007 TRAINER.WEIGHT_UPDATE --spec '{params: {temperature: 2}}'")),
     )
 
     # -- list -----------------------------------------------------------------
@@ -355,3 +369,65 @@ class Command(GroupCommand):
             self.out.error(f"kept {item['run_id']}: " + "; ".join(item["problems"]))
         if not payload["deleted"] and not payload["skipped"] and not payload["failed"]:
             self.out.result("no runs match")
+
+    # -- components -----------------------------------------------------------
+    def sub_components(self, **options):
+        from ...orchestration.live import manager_for_cli
+
+        registry = self.registry_for_read()
+        if registry is None:
+            raise ResourceNotFound("no runs recorded")
+        run_id = resolve_run_id(registry, options["run_id"])
+        manager = manager_for_cli(self.need_settings(), registry)     # RunNotFound -> exit 3
+        if options["action"] == "show":
+            payload = manager.components(run_id)
+            self.out.emit(payload, text=lambda: self._components_text(payload))
+            return 0
+        if not options["slot"] or options["spec"] is None:
+            raise CommandError.usage("components set needs a SLOT and --spec")
+        spec = read_structured(self, options["spec"], inline=True, root=(dict, str))
+        if options["dry_run"]:
+            return self._components_dry_run(manager, run_id, options["slot"], spec)
+        try:
+            queued = manager.request_components(run_id, options["slot"], spec, trusted=True,
+                                                immediate=options["now"])
+        except ComponentMissing as exc:             # the name came from an argument: a lookup, not a config error
+            raise ResourceNotFound(str(exc)) from exc
+        self.out.emit(queued, text=lambda: self.out.result(
+            f"queued {options['slot']} for the {queued['boundary']} boundary; spec_hash {str(queued['spec_hash'])[:12]}"))
+        return 0
+
+    def _components_dry_run(self, manager: Any, run_id: str, slot: str, spec: Any) -> int:
+        """Parse the spec against the slot's recorded kind; queue nothing, touch nothing."""
+        from ...components import ComponentResolver, ComponentSpec
+
+        known = {entry["slot"]: entry for entry in manager.components(run_id)["slots"]}
+        entry = known.get(slot)
+        findings: list[dict[str, Any]] = []
+        if entry is None:
+            findings.append({"code": "E010", "severity": "error",
+                             "message": f"E010: run {run_id} has no slot {slot!r}; slots: {sorted(known)}"})
+        else:
+            try:
+                parsed = ComponentSpec.parse(entry["kind"], spec, allow_patch=True)
+                if parsed.type or parsed.import_path:
+                    ComponentResolver().validate(parsed, trusted=True)
+            except ComponentMissing as exc:
+                raise ResourceNotFound(str(exc)) from exc
+            except ComponentError as exc:
+                findings.append({"code": getattr(exc, "code", "E005"), "severity": "error", "message": str(exc)})
+        payload = {"run_id": run_id, "slot": slot, "spec": spec, "dry_run": True,
+                   "ok": not findings, "findings": findings}
+        self.out.emit(payload, text=lambda: self.out.result(
+            f"{slot}: {'would queue' if not findings else 'would be refused'}"
+            + "".join(f"\n  {item['code']}  {item['message']}" for item in findings)))
+        return 1 if findings else 0
+
+    def _components_text(self, payload: dict[str, Any]) -> None:
+        self.out.table(payload["slots"], (
+            Column("slot", "SLOT"), Column("kind", "KIND"), Column("name", "NAME"),
+            Column("spec_hash", "SPEC_HASH", fmt=lambda value: str(value)[:12]),
+            Column("state", "STATE")), empty=f"run {payload['run_id']} records no non-built-in components")
+        for slot, spec in sorted((payload.get("pending") or {}).items()):
+            self.out.result(f"queued: {slot} -> {spec}")
+        self.out.result(f"source: {payload['source']}")

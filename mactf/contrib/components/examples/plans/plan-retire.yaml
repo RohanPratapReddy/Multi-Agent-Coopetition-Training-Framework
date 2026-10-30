@@ -1,0 +1,4 @@
+label: prune-peer-3
+reason: diverged at epoch 14
+ops:
+  - {op: retire, path: peer-3, reason: "loss non-finite for 3 epochs"}

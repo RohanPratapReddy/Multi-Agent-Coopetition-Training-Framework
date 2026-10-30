@@ -150,6 +150,31 @@ def _block(info: dict[str, Any], level: int, title: str) -> list[str]:
     return lines
 
 
+def component_exit_rows() -> list[tuple[str, str, str, int]]:
+    """The 16.2.1 table of document 17, with the exit code each exception really classifies to."""
+    from mactf.exceptions import (
+        ComponentBuildError, ComponentCollision, ComponentImportDenied, ComponentLocked,
+        ComponentMissing, MutationError, UnsafePolicyDenied, WeightGuardViolation,
+    )
+    from mactf.management.exitcodes import classify
+
+    cases = [
+        ("A settings file or `--set` names an unknown component", ComponentMissing("scorer", "x", ["a"]), "E001"),
+        ("A module is not importable from an untrusted surface", ComponentImportDenied("a:B", "untrusted"), "E006"),
+        ("Registering a name that exists, without `replace`", ComponentCollision("scorer", "x"), "E002"),
+        ("Replacing or removing a locked component or slot", ComponentLocked("scorer", "x", "locked"), "E003"),
+        ("A policy declared `unsafe` without the operator's allowance", UnsafePolicyDenied("p", "unsafe"), "E009"),
+        ("A component cannot be built from its spec", ComponentBuildError("scorer", "x", ValueError("boom")), "E008"),
+        ("A guard violation reaches the top of a command", WeightGuardViolation("s", ["U001"]), "E063"),
+        ("A mutation plan with a hard finding", MutationError("E082", "protected"), "E080-E089"),
+    ]
+    rows = []
+    for situation, exc, code in cases:
+        exit_code, _ = classify(exc)
+        rows.append((situation, type(exc).__name__, code, exit_code))
+    return rows
+
+
 def render(data: dict[str, Any]) -> str:
     from mactf.management.deprecation import DEPRECATIONS, deprecation_message
     from mactf.management.exitcodes import ExitCode
@@ -161,6 +186,11 @@ def render(data: dict[str, Any]) -> str:
     out += [f"| `{_cell(item['usage'])}` | {_cell(item['help'])} |" for item in data["global_options"]]
     out += ["", "## Exit codes", "", "| Code | Name | Meaning |", "|---|---|---|"]
     out += [f"| {int(code)} | `{code.name}` | {EXIT_MEANING[code.name]} |" for code in ExitCode]
+    out += ["", "### Component and mutation failures", "",
+            "Computed by `classify()` from a real instance of each exception.", "",
+            "| Situation | Exception | Code | Exit |", "|---|---|---|---|"]
+    out += [f"| {situation} | `{name}` | {code} | {exit_code} |"
+            for situation, name, code, exit_code in component_exit_rows()]
     out += ["", "## Commands", ""]
     category = None
     for info in data["commands"]:

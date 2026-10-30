@@ -17,19 +17,27 @@ skip compliance.
 
 from __future__ import annotations
 
+import copy
+import logging
 import warnings
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, Sequence
 
 from .. import signals
-from ..compliance import ComplianceResult, constrain, void_rule_ids
+from ..compliance import (
+    DEFAULT_MIN_FLOOR_LAMBDA,
+    ComplianceResult,
+    constrain,
+    effective_non_offsettable,
+    void_rule_ids,
+)
 from ..coopetition.pool import (
     CooperativeAllocation,
     CooperativePool,
     cooperative_total,
 )
-from ..exceptions import ImproperlyConfigured
-from ..rules.catalog import ALL_RULES, NON_OFFSETTABLE, get_rule
+from ..exceptions import ComplianceGuardViolation, ImproperlyConfigured
+from ..rules.catalog import ALL_RULES, get_rule
 from ..rules.precedence import PrecedenceDecision, resolve
 from ..rules.severity import Severity, weight_for
 from .base import ScoreContext, ScorerOutput, ScoringKind
@@ -53,13 +61,30 @@ __all__ = [
     "build_pool",
     "build_scorer",
     "build_stages",
+    "migrate_stage_state",
     "severity_weight",
 ]
+
+_log = logging.getLogger("mactf.scoring.pipeline")
 
 #: Distinguishes "caller omitted ``pool``" from "caller passed ``None``".
 #: Omitting it means "use the pipeline's configured pool"; passing ``None``
 #: explicitly means "score this card without a split".
 _USE_DEFAULT_POOL: Any = object()
+
+#: The stage classes the framework ships. A performance shortcut only: the guard's own
+#: ``_trusted`` applies the same rule, and ``COMPLIANCE.TRUST_BUILTIN = false`` makes
+#: ``guard.enforce`` inspect them too (the structural checks stay on for custom stages).
+_BUILTIN_STAGE_TYPES: tuple[type, ...] = (WarningScorer, RewardScorer, PenaltyScorer)
+
+def _is_builtin_stage(stage: Any) -> bool:
+    """Exact-type identity test. Never ``type(x) in (...)``: that calls ``==`` on the class,
+    which a metaclass can override to impersonate a built-in and skip the guard."""
+    return any(type(stage) is built for built in _BUILTIN_STAGE_TYPES)
+
+
+#: The per-node stage kinds ``SCORING.STAGES`` may name, in chain order.
+STAGE_KINDS: tuple[str, ...] = ("warning", "reward", "penalty")
 
 
 class ScoringPipeline(_ScorerABC):
@@ -81,6 +106,7 @@ class ScoringPipeline(_ScorerABC):
         pool: CooperativePool | None = None,
         engine_config: Mapping[str, Any] | None = None,
         points_engine: Any = None,
+        guard: Any = None,
     ) -> None:
         super().__init__(config=score_config or {})
         self.engine_config: dict[str, Any] = dict(engine_config or {})
@@ -105,6 +131,9 @@ class ScoringPipeline(_ScorerABC):
         else:
             for stage in scorers:
                 self._add_unchecked(stage)
+        self._guard: Any = guard
+        #: What the guard did for the most recent ``_walk`` (set even when clean).
+        self._last_guard_report: Any = None
         self._validate_chain()
 
     # -- chain management ------------------------------------------------
@@ -169,6 +198,11 @@ class ScoringPipeline(_ScorerABC):
                     f"{type(stage).__name__} cannot be a stage of a per-node "
                     "ScoringPipeline; build a HierarchicalScorer around the pipeline"
                 )
+            if stage.kind == ScoringKind.PIPELINE:
+                raise ImproperlyConfigured(
+                    f"{type(stage).__name__} is a ScoringPipeline; a pipeline cannot be a "
+                    "stage of another"
+                )
             existing = by_kind.get(stage.kind)
             if existing is not None:
                 raise ImproperlyConfigured(
@@ -210,6 +244,74 @@ class ScoringPipeline(_ScorerABC):
                     "warning stage must run before reward and penalty so an escalated "
                     "rule is neither excluded from P nor counted twice"
                 )
+
+    @property
+    def guard(self) -> Any:
+        """The compliance guard, built lazily so importing the pipeline never imports it."""
+        if self._guard is None:
+            from ..components.guards.compliance import ComplianceGuard, GuardPolicy
+
+            self._guard = ComplianceGuard(
+                GuardPolicy(
+                    min_floor_lambda=float(
+                        self.score_config.get("MIN_FLOOR_LAMBDA", DEFAULT_MIN_FLOOR_LAMBDA)
+                    )
+                )
+            )
+        return self._guard
+
+    @guard.setter
+    def guard(self, value: Any) -> None:
+        self._guard = value
+
+    def replace(
+        self, scorer: Scorer, *, migrate: Callable[[Scorer, Scorer], None] | None = None
+    ) -> Scorer:
+        """Swap the stage of ``scorer.kind`` for ``scorer`` and return the old one.
+
+        Atomic: ``migrate(old, new)`` runs first and may only write to ``new``; the chain is
+        then validated, and a failure restores the old stage, so a rejected swap leaves the
+        pipeline exactly as it was.
+        """
+        if not isinstance(scorer, _ScorerABC):
+            raise ImproperlyConfigured(
+                f"a scoring stage must be a Scorer subclass, got {type(scorer).__name__}"
+            )
+        old = self.get(scorer.kind)
+        index = self._chain.index(old)
+        if migrate is not None:
+            migrate(old, scorer)
+        self._chain[index] = scorer
+        try:
+            self._validate_chain()
+        except ImproperlyConfigured:
+            self._chain[index] = old
+            raise
+        return old
+
+    def stage_inject(self, *, trusted: bool = True) -> dict[str, Any]:
+        """The offer ``SlotTable.swap`` makes to a stage factory (see ``build_stages``)."""
+        return {
+            "config": dict(self.score_config),
+            "policy": self.warning_policy,
+            "trusted": trusted,
+        }
+
+    def sync_from_slots(self, slots: Any) -> list[ScoringKind]:
+        """Make the chain match ``scoring.<kind>`` slots. Call at an episode boundary,
+        after ``slots.apply_pending(Boundary.EPISODE, inject=self.stage_inject())``."""
+        changed: list[ScoringKind] = []
+        for kind in self.REQUIRED_KINDS:
+            stage = slots.get(f"scoring.{kind.value}").instance
+            if getattr(stage, "kind", None) is not kind:
+                raise ImproperlyConfigured(
+                    f"slot scoring.{kind.value} holds {type(stage).__name__}, whose kind is "
+                    f"{getattr(getattr(stage, 'kind', None), 'value', None)!r}, not {kind.value!r}"
+                )
+            if stage is not self.get(kind):
+                self.replace(stage, migrate=migrate_stage_state)
+                changed.append(kind)
+        return changed
 
     # -- registry compatibility -----------------------------------------
     @property
@@ -326,7 +428,7 @@ class ScoringPipeline(_ScorerABC):
 
         continuous = self._compose(ctx, outputs, decision)
 
-        non_offsettable = set(self.score_config.get("NON_OFFSETTABLE", NON_OFFSETTABLE))
+        non_offsettable = effective_non_offsettable(self.score_config.get("NON_OFFSETTABLE"))
         result: ComplianceResult = constrain(
             continuous,
             non_offsettable=non_offsettable,
@@ -369,7 +471,7 @@ class ScoringPipeline(_ScorerABC):
             suppressed=suppressed,
             violated_non_offsettable=void_rules,
             severity=highest_severity(ledger),
-            metadata={"compliance": result.as_dict()},
+            metadata=self._card_metadata(result),
             branch_void=tuple(sorted(branch_void)),
         )
 
@@ -470,27 +572,75 @@ class ScoringPipeline(_ScorerABC):
             card.metadata["evidence_digest"] = evidence.digest()
 
     def _walk(self, ctx: ScoreContext) -> dict[ScoringKind, ScorerOutput]:
-        """Run every stage in ascending order, threading the context through."""
+        """Run every stage in ascending order, threading the context through.
+
+        Stages see a read-only ledger. ``prepare`` may change only the fields its kind
+        owns. After the walk the guard checks every non-built-in output (6.4).
+        """
+        guard = self.guard
+        self._last_guard_report = None
+        source = ctx.ledger.unwrap() if hasattr(ctx.ledger, "unwrap") else ctx.ledger
+        snapshot = guard.snapshot(source)
+        ctx = ctx.evolve(ledger=guard.view(source))
+        chain = self.chain
+        custom = any(not _is_builtin_stage(stage) for stage in chain)
+        if custom:
+            # A stage that edits ``ctx.config`` in place must not edit the pipeline's own
+            # (the context holds a shallow copy of it): hand custom stages a private copy.
+            ctx = ctx.evolve(
+                config=copy.deepcopy(dict(ctx.config)),
+                severity_weights=copy.deepcopy(dict(ctx.severity_weights)),
+            )
+        pristine = guard.pristine(ctx) if custom else None
+        structural: list[Any] = []
         outputs: dict[ScoringKind, ScorerOutput] = {}
-        for stage in self.chain:
-            prepared = stage.prepare(ctx)
-            if not isinstance(prepared, ScoreContext):
-                raise ImproperlyConfigured(
-                    f"{type(stage).__name__}.prepare() returned "
-                    f"{type(prepared).__name__}, not a ScoreContext"
-                )
-            ctx = prepared
-            output = stage.score(ctx)
-            output = stage.finalize(ctx, output)
-            if not isinstance(output, ScorerOutput):
-                raise ImproperlyConfigured(
-                    f"{type(stage).__name__}.score() returned "
-                    f"{type(output).__name__}, not a ScorerOutput"
-                )
+        for stage in chain:
+            is_custom = not _is_builtin_stage(stage)
+            try:
+                prepared = stage.prepare(ctx)
+                if not isinstance(prepared, ScoreContext):
+                    raise ImproperlyConfigured(
+                        f"{type(stage).__name__}.prepare() returned "
+                        f"{type(prepared).__name__}, not a ScoreContext"
+                    )
+                if is_custom:
+                    structural.extend(guard.check_prepare(stage, ctx, prepared, source))
+                ctx = prepared
+                output = stage.score(ctx)
+                output = stage.finalize(ctx, output)
+                if not isinstance(output, ScorerOutput):
+                    raise ImproperlyConfigured(
+                        f"{type(stage).__name__}.score() returned "
+                        f"{type(output).__name__}, not a ScorerOutput"
+                    )
+            except Exception as error:
+                if is_custom:
+                    # A stage that edited the ledger and then raised must not leave the
+                    # edit behind: report the tampering (and undo it) before the error.
+                    tampered = guard.check_after_stage(stage, source, snapshot)
+                    if tampered:
+                        raise ComplianceGuardViolation(
+                            [item.as_dict() for item in tampered]
+                        ) from error
+                raise
+            if is_custom:
+                structural.extend(guard.check_after_stage(stage, source, snapshot))
+                structural.extend(guard.check_pristine(stage, ctx, pristine))
             outputs[stage.kind] = output
+        if structural:
+            raise ComplianceGuardViolation([item.as_dict() for item in structural])
+        outputs, report = guard.enforce(ctx, outputs, chain, pristine)
+        self._last_guard_report = report
         # Stash the prepared context so callers and the pipeline can read it.
         self._last_context = ctx
         return outputs
+
+    def _card_metadata(self, result: ComplianceResult) -> dict[str, Any]:
+        metadata: dict[str, Any] = {"compliance": result.as_dict()}
+        report = self._last_guard_report
+        if report is not None and report.violations:
+            metadata["compliance_guard"] = report.as_dict()
+        return metadata
 
     def _mutations(self, ctx: ScoreContext, action: str) -> list[Any]:
         mutations = ctx.extras.get("warning_mutations", ())
@@ -684,23 +834,91 @@ def build_stages(
     severity_weights: Mapping[str, Any] | None = None,
     warning_policy: WarningPolicy | None = None,
     registries: dict[str, WarningRegistry] | None = None,
+    specs: Mapping[str, Any] | None = None,
+    slots: Any = None,
+    trusted: bool = True,
 ) -> list[Scorer]:
-    """The three default stages, in the order document 07 mandates."""
+    """The three stages, in the order document 07 mandates.
+
+    ``specs`` is ``SCORING.STAGES``. When it is empty the three built-ins are built
+    directly, exactly as before. When it is not, each stage is installed into
+    ``slots`` (a ``SlotTable``) under ``scoring.<kind>``, so it can be swapped and
+    fingerprinted later; ``trusted`` is false for stages named by an untrusted
+    surface (the API), which refuses ``import:`` specs outside the allow-list.
+    """
     config = dict(score_config or {})
     policy = warning_policy or WarningPolicy.from_settings(
         dict(config.get("WARNINGS", {}))
     )
-    return [
-        WarningScorer(config=config, policy=policy, registries=registries),
-        RewardScorer(config=config),
-        PenaltyScorer(config=config),
-    ]
+    if not specs:
+        return [
+            WarningScorer(config=config, policy=policy, registries=registries),
+            RewardScorer(config=config),
+            PenaltyScorer(config=config),
+        ]
+
+    unknown = sorted(set(specs) - set(STAGE_KINDS))
+    if unknown:
+        raise ImproperlyConfigured(
+            f"SCORING.STAGES has unknown kind(s) {unknown}; per-node stages are "
+            f"{list(STAGE_KINDS)} (a hierarchy is selected by HIERARCHY.ROLLUP)"
+        )
+    if slots is None:
+        from ..components.resolver import ComponentResolver
+        from ..components.slots import SlotTable
+
+        slots = SlotTable(ComponentResolver(), trusted=trusted)
+    inject = {
+        "config": config,
+        "policy": policy,
+        "registries": registries,
+        "trusted": trusted,
+    }
+    stages: list[Scorer] = []
+    for kind in STAGE_KINDS:
+        slot = slots.install(f"scoring.{kind}", "scorer", specs.get(kind, kind), inject=inject)
+        stage = slot.instance
+        if stage.kind.value != kind:
+            raise ImproperlyConfigured(
+                f"SCORING.STAGES.{kind} resolves to {type(stage).__name__}, whose kind is "
+                f"{stage.kind.value!r}, not {kind!r}"
+            )
+        stages.append(stage)
+    return stages
+
+
+def migrate_stage_state(old: Scorer, new: Scorer) -> None:
+    """Carry state from ``old`` to ``new`` for a same-kind swap. Writes only to ``new``.
+
+    Only the warning stage has state worth keeping: its registries hold every peer's
+    warnings, clean streaks and expiry, which framework.md W1-W9 require to survive.
+    The reward and penalty stages are stateless, so for them this is a kind check.
+    """
+    from ..exceptions import ComponentContractError
+
+    if old.kind is not new.kind:
+        raise ComponentContractError(
+            "scorer", type(new).__name__,
+            [f"cannot replace a {old.kind.value} stage with a {new.kind.value} stage"],
+        )
+    if old.kind is ScoringKind.WARNING:
+        registries = getattr(old, "registries", None)
+        if registries is None or not hasattr(new, "registries"):
+            raise ComponentContractError(
+                "scorer", type(new).__name__,
+                ["a replacement WARNING stage exposes `registries` so warning state survives"],
+            )
+        new.registries = registries  # the live dict moves; ``new`` owns it from now on
+        if hasattr(old, "policy") and hasattr(new, "policy"):
+            new.policy = old.policy
 
 
 def build_scorer(
     settings: Any,
     *,
     scorers: Sequence[Scorer] | None = None,
+    slots: Any = None,
+    trusted: bool = True,
 ) -> ScoringPipeline:
     """Construct a pipeline. With no ``scorers``, the three defaults are used.
 
@@ -708,18 +926,47 @@ def build_scorer(
     set and a budget is configured; when it is disabled the scorecard's
     ``competitive``/``cooperative`` fields stay ``None``, which reports "not
     computed" rather than a misleading zero.
+
+    ``SCORING.STAGES`` (document 17 section 6.2) selects stages by spec; ``slots`` and
+    ``trusted`` are handed to :func:`build_stages` for it. ``COMPLIANCE`` configures the
+    guard every pipeline carries.
     """
+    from ..components.guards.compliance import ComplianceGuard, GuardPolicy
+
     policy = WarningPolicy.from_settings(settings["WARNINGS"])
     score_config = dict(settings["SCORING"])
+    guard_policy = GuardPolicy.from_settings(settings)
+    if guard_policy.min_floor_lambda != DEFAULT_MIN_FLOOR_LAMBDA:
+        # Recorded in the pipeline's config (and so its state dict) on purpose: the floor a
+        # run was scored under is part of the run's identity. The default leaves it out,
+        # which keeps default checkpoints byte-identical.
+        score_config["MIN_FLOOR_LAMBDA"] = guard_policy.min_floor_lambda
+    if guard_policy.mode == "fallback":
+        _log.warning(
+            "W003 COMPLIANCE.GUARD_MODE is 'fallback': a stage that breaks the compliance "
+            "contract is replaced by the reference stage instead of failing the run"
+        )
     severity_weights = dict(settings["SEVERITY"]["WEIGHTS"])
     pool = build_pool(settings)
+    stage_specs = dict(score_config.get("STAGES") or {})
+    stages = scorers
+    if stages is None and stage_specs:
+        stages = build_stages(
+            score_config=score_config,
+            severity_weights=severity_weights,
+            warning_policy=policy,
+            specs=stage_specs,
+            slots=slots,
+            trusted=trusted,
+        )
     return ScoringPipeline(
-        scorers,
+        stages,
         score_config=score_config,
         severity_weights=severity_weights,
         warning_policy=policy,
         pool=pool,
         engine_config=dict(settings["ENGINE"]) if "ENGINE" in settings else {},
+        guard=ComplianceGuard(guard_policy),
     )
 
 

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import logging
 import math
 import time
 from dataclasses import dataclass, field, replace
@@ -35,12 +36,21 @@ import torch
 import torch.nn as nn
 
 from .. import signals
-from ..conf import Settings, get_settings
+from ..components.function_book import FunctionBook
+from ..components.kappa_plan import KappaPlan
+from ..components.kinds import Boundary
+from ..components.loss_compliance import ensure_compliance
+from ..components.resolver import ComponentResolver
+from ..components.slots import SlotTable, SwapRecord
+from ..components.strategy_plan import DEFAULT_PATH, StrategyPlan
+from ..components.weight_plan import ROOT_LABEL, WeightPlan, group_label
+from ..conf import LOSS_DEFAULTS, Settings, get_settings
 from ..conf_files import authored_keys, is_authored
 from ..coopetition.aggregation import (
     AggregateResult,
     AggregationReport,
     Aggregator,
+    build_aggregator,
     feasible_bounds,
 )
 from ..coopetition.delegation import build_delegation
@@ -52,12 +62,11 @@ from ..coopetition.peer import (
 )
 from ..coopetition.strategy import (
     FrozenPeerStrategy,
-    HierarchicalStrategy,
-    KappaSoftmaxStrategy,
     PeerStrategy,
-    build_peer_strategy,
+    TreeView,
     deduplicate_tied,
     group_layouts,
+    tree_view,
 )
 from ..coopetition.synthesis import build_synthesis
 from ..coopetition.temperature import AdaptiveKappa
@@ -69,16 +78,22 @@ from ..coopetition.tree import (
     branch_void,
 )
 from ..distill.config import DistillationConfig
+from ..coopetition.weight_guard import Violation as WeightViolation
+from ..coopetition.weight_guard import WeightGuard
 from ..coopetition.weights import (
+    GroupView,
     KappaSoftmaxAverage,
+    WeightTraits,
     WeightUpdateStrategy,
-    build_weight_update,
+    traits_of,
 )
 from ..exceptions import (
     ComplianceError,
     ContractError,
     ImproperlyConfigured,
+    MutationError,
     ValidationError,
+    WeightGuardViolation,
 )
 from ..orchestration.checkpoint_v2 import (
     CheckpointContext,
@@ -86,11 +101,10 @@ from ..orchestration.checkpoint_v2 import (
     ResumeReport,
 )
 from ..orchestration.episode import Episode, EpisodeRunner, Task
-from ..rl.advantage import penalise_void_advantage
 from ..rl.functions.loss import CompositeLoss, LossFunction
 from ..rl.loss import LossConfig
 from ..rl.policy import make_policy
-from ..runtime import Runtime, autocast, build_runtime, seed_everything
+from ..runtime import Runtime, build_runtime, seed_everything
 from ..scoring.hierarchy import HierarchicalScorer, run_inference
 from ..scoring.normalize import (
     CohortNormalizer,
@@ -103,7 +117,18 @@ from ..scoring.scorecard import EpisodeScorecard
 from ..training_utils import state_targets_for
 from .callbacks import Callback, CallbackList, HOOK_NAMES, build_callbacks
 from .finetune import FinetuneConfig, apply_finetuning
+from .freeze import RETIRED, FreezeSet
+from .mutation import MutationLimits, MutationPlan, MutationReport, structure_digest
+from .mutation import add_peer as _op_add
+from .mutation import modify_peer as _op_modify
+from .mutation import purge_peer as _op_purge
+from .mutation import retire_peer as _op_retire
+from .mutation import revive_peer as _op_revive
+from .mutation_engine import MutationEngine
+from .mutation_reconcile import MutationState
 from .optimizer import MACTFOptimizer, StepOutcome
+from .optimizer_plan import PLAN_KEYS, OptimizerEntry, OptimizerPlan, verify_entry
+from .path_state import PathState
 from .protocol import (
     EpochResult,
     StepResult,
@@ -117,7 +142,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .logging import MACTFLogger
     from .watchdog import HealthReport, MACTFWatchdog
 
+log = logging.getLogger("mactf.training.trainer")
+
 __all__ = ["MACTFTrainer", "TrainSpec"]
+
+#: The engine that writes a schema-2 checkpoint. ``Orchestrator`` writes schema 1 and no
+#: ``identity`` section, so the key's absence is how a resume reads "orchestrator" (section 13.4.8,
+#: ``E091``).
+ENGINE_NAME = "trainer"
 
 #: How a node's parameters relate to another node's (document 08 section 5.3).
 SHARING_MODES = ("independent", "shared_trunk", "tied_weights")
@@ -321,13 +353,14 @@ class MACTFTrainer:
         # -- validation 6b: distillation resolvable (document 14 section 19.1) ---
         self._distillation = self._resolve_distillation(distillation, self.settings)
         if self._distillation.enabled:
-            if trainer is not None:
+            if trainer is not None and not getattr(trainer, "composes_distillation", False):
                 raise ImproperlyConfigured(
                     "trainer=... and distillation=... are mutually exclusive; both "
                     "install the per-step policy. Pass the teachers to distillation= and "
                     "drop trainer=, construct CoDistillStep yourself and pass it as "
-                    "trainer=, or pass distillation=False to turn a project-level "
-                    "DISTILLATION.ENABLED off for this run."
+                    "trainer=, declare composes_distillation=True on the policy, or pass "
+                    "distillation=False to turn a project-level DISTILLATION.ENABLED off "
+                    "for this run."
                 )
             if steps_per_epoch is not None and int(steps_per_epoch) != 1:
                 raise ImproperlyConfigured(
@@ -440,6 +473,79 @@ class MACTFTrainer:
         self._group_aggregators: dict[str, Aggregator] = {}
         self._level_controllers: dict[str | None, AdaptiveKappa] = {}
         self._loss_function: LossFunction | None = None
+
+        # -- tree mutation (document 17 section 12.7) -----------------------------------
+        self.mutation_limits: MutationLimits = MutationLimits()
+        self.mutation_journal: list[dict[str, Any]] = []
+        self.topology_epoch: int = 0
+        self._tombstones: set[str] = set()
+        self._phase: str = "idle"                  # idle | epoch | observe
+        self._mutations_in_cycle: int = 0
+        self._active_view: PeerTree | None = None
+        self._shared_trunk: nn.Module | None = None
+        self._loss_baseline: int = 0               # first ``history`` index judged by the loss probes
+        self._rate_baseline: int = 0               # first ``_epoch_seconds`` index judged by the rate probe
+        self._node_specs: dict[str, dict[str, Any]] = {}   # path -> effective spec of a created or rebuilt node
+        self._node_meta: dict[str, dict[str, Any]] = {}    # path -> final metadata of a created or touched node
+        self._base_digest: str = ""                        # structure digest of the tree as built
+        self._build_meta: dict[str, dict[str, Any]] = {}   # path -> metadata the tree was built with
+        self.engine: MutationEngine = MutationEngine(self)
+        self.path_state: PathState = PathState(self)
+
+        # -- document 17: policies, functions, optimizer plan, freeze set ----------------
+        # ``_trainer_policy`` keeps the meaning it always had: the policy the caller supplied
+        # (``trainer=``), the distillation step, or ``None`` for the default step. The object
+        # ``train_step`` calls (the default policy, or a guard around a foreign one) is
+        # ``_policy``; both are set by ``_attach_policy`` in ``build``.
+        self._policy: Any = None
+        self._policy_origin: Any = None
+        self._policy_guard: Any = None
+        self.distill: Any = None
+        #: ``False`` for a run created through the API without ``COMPONENTS.API_ALLOW_IMPORT``.
+        self._components_trusted = True
+        self._strict_restore = bool(
+            dict(self.settings.get("COMPONENTS") or {}).get("STRICT_RESTORE", False)
+        )
+        # A trainer built in code with its own ``settings=`` may be the first thing to look at
+        # ``COMPONENTS``: load the named modules before any name below is resolved. A no-op when
+        # ``conf.configure`` already loaded the same block.
+        from ..components.plugins import ensure_components_loaded
+
+        ensure_components_loaded(self.settings)
+        self.resolver = ComponentResolver()
+        self.slots = SlotTable(self.resolver, trusted=self._components_trusted)
+        trainer_block = dict(self.settings.get("TRAINER") or {})
+        self.functions = FunctionBook.from_settings(
+            self.slots,
+            self.settings.get("RL"),
+            loss_compliance=str(trainer_block.get("LOSS_COMPLIANCE", "require")).lower(),
+            compliance_coefficient=self._compliance_coefficient(),
+            guard_mode=str(
+                dict(self.settings.get("COMPLIANCE") or {}).get("GUARD_MODE", "enforce")
+            ).lower(),
+            trusted=self._components_trusted,
+        )
+        self.functions.configure(self.settings.get("RL"))
+        self.freeze = FreezeSet(mode=str(trainer_block.get("FREEZE_MODE", "legacy")))
+        # -- document 17 sections 10 and 11: the weight plan and the strategy plan ------
+        self.weight_plan: WeightPlan | None = None
+        self.weight_guard: WeightGuard | None = None
+        self.kappa_plan: KappaPlan | None = None
+        self.weight_warnings: list[str] = []
+        self.strategy_plan: StrategyPlan | None = None
+        self.strategy_warnings: list[str] = []
+        #: Notes from the document 17 section 14 component verification of a resume
+        #: (``W052``, ``W053``). ``mactf runs show`` prints them.
+        self.component_notes: list[str] = []
+        #: The aggregator's resolved component when ``TRAINER.AGGREGATOR`` named one.
+        self._aggregator_resolved: Any = None
+        #: Parameter writes performed so far (``_write`` increments it); the strategy guard
+        #: compares its delta over one call with the writes the context audited (``Y003``).
+        self.write_count: int = 0
+        self.optimizer_plan: OptimizerPlan | None = None
+        self._verified_optimizers: set[str] = set()
+        self._optimizer_warnings: list[str] = []
+        self._function_warnings: list[str] = []
 
     # ------------------------------------------------------------------
     # Construction helpers and validation
@@ -573,6 +679,17 @@ class MACTFTrainer:
 
         tree = self._build_tree()
         self.tree = tree
+        trainer_block = dict(self.settings.get("TRAINER") or {})
+        self.mutation_limits = MutationLimits.from_settings(
+            trainer_block.get("MUTATION"),
+            initial_roots=len(tree.root_paths),
+            initial_nodes=len(tree),
+            growth_ratio=float(
+                dict(self.settings.get("WATCHDOG") or {}).get("MAX_TREE_GROWTH_RATIO", 0) or 0
+            ) or None,
+        )
+        self.freeze.bind(tree)
+        self.freeze.set_mode(str(trainer_block.get("FREEZE_MODE", "legacy")).lower())
         self.peers = self._build_peers(tree, runtime)
 
         # Reference policy: one per run, frozen, from the first root.
@@ -586,12 +703,21 @@ class MACTFTrainer:
         self._bind_optimizers(runtime)
 
         # Temperature, aggregator, strategies.
+        roots = len(tree.root_paths)
+        self.kappa_plan = KappaPlan.from_settings(coopetition)
+        root_settings = self.kappa_plan.settings_for(ROOT_LABEL, coopetition)
         # One owner of the temperature: the aggregator's controller *is* the root
         # controller, so the checkpointed kappa is the kappa that was used.
-        roots = len(tree.root_paths)
-        self.aggregator = self._aggregator or Aggregator.from_settings(
-            coopetition, num_peers=max(1, roots)
+        aggregator_record: dict[str, Any] = {}
+        self.aggregator = self._aggregator or build_aggregator(
+            trainer_block.get("AGGREGATOR"),
+            root_settings,
+            num_peers=max(1, roots),
+            resolver=self.resolver,
+            trusted=self._components_trusted,
+            record=aggregator_record,
         )
+        self._aggregator_resolved = aggregator_record.get("resolved")
         if self._kappa is not None:
             self.aggregator.controller = self._kappa
         self.controller = self.aggregator.controller
@@ -599,7 +725,7 @@ class MACTFTrainer:
         levels[None] = self.controller
         self._level_controllers = levels
         self.controllers = {
-            ("root" if parent is None else parent): controller
+            (ROOT_LABEL if parent is None else parent): controller
             for parent, controller in levels.items()
         }
         for _parent, members in aggregation_groups(tree):
@@ -608,17 +734,31 @@ class MACTFTrainer:
                 floor=float(coopetition.get("WEIGHT_FLOOR", 0.02)),
                 cap=float(coopetition.get("WEIGHT_CAP", 0.6)),
             )
-        self.weight_strategy = build_weight_update(
-            self._weight_update_spec, aggregator=self.aggregator
+        self.weight_plan = WeightPlan.from_settings(
+            self.settings, self.slots,
+            aggregator=self.aggregator,
+            code_spec=self._weight_update_spec,
+            resolver=self.resolver,
+            trusted=self._components_trusted,
         )
-        self.strategy = build_peer_strategy(
-            self._peer_strategy_spec, hierarchy=self._hierarchy is not None
+        self.weight_guard = self.weight_plan.guard
+        self.weight_strategy = self.weight_plan.strategy_for(ROOT_LABEL, self.aggregator)
+        self._validate_weight_plan(initial=True)
+        # The strategy plan: ``peer_strategy=`` beats an authored ``TRAINER.PEER_STRATEGY``,
+        # which beats the default for the tree's shape (``hierarchical`` on a hierarchy, else
+        # ``kappa_softmax``, the mixing strategy a default flat run needs to match ``Orchestrator``).
+        self.strategy_plan = StrategyPlan.from_settings(
+            self.settings, self.slots,
+            code_spec=self._peer_strategy_spec,
+            hierarchy=self._hierarchy is not None,
+            resolver=self.resolver,
+            trusted=self._components_trusted,
         )
-        if self._peer_strategy_spec is None and self._hierarchy is None:
-            # The equivalence gate (document 08 section 9) requires a default flat
-            # run to aggregate exactly as ``Orchestrator`` does, so the default
-            # flat strategy is the one that mixes parameters.
-            self.strategy = KappaSoftmaxStrategy()
+        self.strategy = self.strategy_plan.default_instance()
+        self._validate_strategy_plan(initial=True)
+        for instance in self.strategy_plan.live_instances():
+            instance.attach(self)
+        self.freeze.check_learners(node.path for node in tree.walk("root-first") if node.peer is not None)
 
         # Delegation and synthesis only exist in a hierarchy.
         if self._hierarchy is not None:
@@ -647,7 +787,8 @@ class MACTFTrainer:
                 self.watchdog.checkpoint = _CheckpointBridge(
                     self.watchdog.checkpoint, self
                 )
-        self._attach_distillation()
+        self._attach_policy()
+        self._validate_functions()
         self._setup_custom_trainer()
 
         batch_size = self._batch_size_override or int(
@@ -679,7 +820,19 @@ class MACTFTrainer:
             dtype=str(runtime.dtype).replace("torch.", ""),
             distillation=self._distillation_record(),
         )
-        self._initial_nodes = len(self.peers)
+        self._initial_nodes = len(self.active_tree)
+        self._base_digest = structure_digest(self.tree, ())
+        self._build_meta = {
+            node.path: copy.deepcopy(node.metadata) for node in self.tree.walk("root-first") if node.metadata
+        }
+        if self.mutation_limits.enabled:
+            problems = self.path_state.audit()
+            if problems:
+                raise MutationError(
+                    "E089",
+                    "the trainer is inconsistent before any mutation ran, so one would only make it worse: "
+                    + "; ".join(problems),
+                )
         self.built = True
         self._dispatch("on_build", self)
         self.callbacks.dispatch("on_build", self)
@@ -825,17 +978,12 @@ class MACTFTrainer:
 
     def _build_peers(self, tree: PeerTree, runtime: Runtime) -> dict[str, Peer]:
         self._tree_in_build = tree
-        training = self._training_settings()
-        learning_rate = float(training.get("LEARNING_RATE", 1e-3))
-        action_dim = int(training.get("ACTION_DIM", 4))
-        state_dim = int(training.get("STATE_DIM", 16))
         sharing = str(getattr(self._hierarchy, "sharing", "independent"))
         freeze_base = bool(
             self.finetuning.freeze_base if self.finetuning is not None else True
         )
 
         peers: dict[str, Peer] = {}
-        roots = list(tree.root_paths)
         trunk: nn.Module | None = None
         for node in tree.walk("root-first"):
             module = self._module_for(node.path)
@@ -849,30 +997,52 @@ class MACTFTrainer:
                     if freeze_base:
                         for parameter in trunk.parameters():
                             parameter.requires_grad_(False)
+                    self._shared_trunk = trunk
                 module = _with_shared_trunk(trunk, module)
 
-            module, report = apply_finetuning(
-                module, self.finetuning, device=runtime.device
-            )
-            peer = build_peer(
-                module,
-                name=node.path,
-                runtime=runtime,
-                learning_rate=learning_rate,
-                action_dim=action_dim,
-                state_dim=state_dim,
-                weight_decay=float(training.get("WEIGHT_DECAY", 0.0)),
-            )
-            peer.metadata["depth"] = node.depth
-            peer.metadata["sharing"] = sharing
-            peer.metadata["finetuning"] = report
-            if node.depth == 1 and node.path in roots:
-                peer.metadata["role"] = "root"
+            peer = self._assemble_peer(node.path, node.depth, module, runtime)
             node.peer = peer
             peers[node.path] = peer
         if not peers:  # pragma: no cover - the tree always has one node
             raise ImproperlyConfigured("the tree produced no nodes")
         return peers
+
+    def _assemble_peer(
+        self,
+        path: str,
+        depth: int,
+        module: nn.Module,
+        runtime: Runtime,
+        *,
+        finetuned: bool = False,
+    ) -> Peer:
+        """Module -> peer: finetuning, the optimizer-less ``build_peer``, and the metadata.
+
+        ``finetuned`` says the module is a copy of a peer that already went through
+        ``apply_finetuning``; the call is then a no-op (``_already_applied``) and the flag is only
+        recorded. The peer is *not* placed in the tree or in ``self.peers``: the caller does that,
+        which is what lets the engine stage a peer without touching the live trainer.
+        """
+        training = self._training_settings()
+        sharing = str(getattr(self._hierarchy, "sharing", "independent"))
+        module, report = apply_finetuning(module, self.finetuning, device=runtime.device)
+        peer = build_peer(
+            module,
+            name=path,
+            runtime=runtime,
+            learning_rate=float(training.get("LEARNING_RATE", 1e-3)),
+            action_dim=int(training.get("ACTION_DIM", 4)),
+            state_dim=int(training.get("STATE_DIM", 16)),
+            weight_decay=float(training.get("WEIGHT_DECAY", 0.0)),
+        )
+        peer.metadata["depth"] = depth
+        peer.metadata["sharing"] = sharing
+        peer.metadata["finetuning"] = report
+        if finetuned:
+            peer.metadata["finetuning_inherited"] = True
+        if depth == 1:
+            peer.metadata["role"] = "root"
+        return peer
 
     def _validate_group_layouts(self, tree: PeerTree) -> None:
         for _parent, members in aggregation_groups(tree):
@@ -880,22 +1050,30 @@ class MACTFTrainer:
                 continue
             group_layouts(self.peers, members)
 
-    def _optimizer_block(self) -> dict[str, Any]:
-        """The ``OPTIMIZER`` block when the project wrote it, else ``{}``.
+    def _default_block_authored(self) -> frozenset[str] | None:
+        """Keys the project wrote in ``OPTIMIZER``, *excluding* the plan keys.
 
-        ``DEFAULTS`` carries an ``OPTIMIZER`` block, so its mere presence proves
-        nothing; a legacy project must keep its Adam at ``TRAINING.LEARNING_RATE``.
-        When the project wrote the block but left ``LR`` or ``MAX_GRAD_NORM`` out,
-        those two defer to ``TRAINING`` rather than to the framework default, so a
-        ``TRAINING.LEARNING_RATE`` written in ``trainer.yaml`` is not silently
-        replaced by ``OPTIMIZER``'s ``1e-3``.
+        Authoring only ``OVERRIDES`` (or ``MIGRATE``, ``VERIFY``, ``STRICT_GLOBS``) does not
+        author the default optimizer: the nodes the overrides do not select keep the legacy
+        Adam at ``TRAINING.LEARNING_RATE`` (invariant O1).
         """
-        if not is_authored(self.settings, "OPTIMIZER"):
+        written = authored_keys(self.settings, "OPTIMIZER")
+        if written is None:
+            return None
+        return frozenset(written) - PLAN_KEYS
+
+    def _optimizer_block(self) -> dict[str, Any]:
+        """The ``OPTIMIZER`` block when the project wrote a default optimizer, else ``{}``.
+
+        Same as ``trainer.py:883-905`` except that writing only plan keys (``OVERRIDES`` and
+        friends) does not count as writing the default optimizer.
+        """
+        written = self._default_block_authored()
+        if not is_authored(self.settings, "OPTIMIZER") or written == frozenset():
             return {}
         block = dict(self.settings.get("OPTIMIZER", {}) or {})
         if not block:
             return {}
-        written = authored_keys(self.settings, "OPTIMIZER")
         training = self._training_settings()
         if written is not None:
             if "LR" not in written and "LEARNING_RATE" in training:
@@ -904,64 +1082,168 @@ class MACTFTrainer:
                 block["MAX_GRAD_NORM"] = training["MAX_GRAD_NORM"]
         return block
 
-    def _bind_optimizers(self, runtime: Runtime) -> None:
-        scaler = runtime.grad_scaler
-        for path, peer in self.peers.items():
-            module = peer.adapter
-            spec = self._optimizer_spec
-            block = self._optimizer_block()
-            # An explicit ``optimizer=`` argument wins over the block, which wins
-            # over the inline default: an argument is an override, a block is
-            # configuration, a default is a default.
-            if spec is not None:
-                optimizer = MACTFOptimizer.from_spec(spec)
-            elif block:
-                optimizer = MACTFOptimizer.from_block(block, node_path=path)
-            else:
-                optimizer = MACTFOptimizer.from_spec(
-                    {
-                        "type": "torch",
-                        "class": "Adam",
-                        "lr": float(self._training_settings().get("LEARNING_RATE", 1e-3)),
-                    }
-                )
+    def _build_optimizer_plan(self) -> OptimizerPlan:
+        from .optimizer_plan import OptimizerPlan
+        from .schedulers import horizon
+
+        training = self._training_settings()
+        steps = self._steps_override or 1
+        accumulation = max(
+            int(self.grad_accumulation or 1),
+            int(training.get("GRAD_ACCUMULATION", 1) or 1),
+        )
+        plan = OptimizerPlan.from_settings(
+            self.settings,
+            block=self._optimizer_block(),
+            written=self._default_block_authored(),
+            horizon=horizon(int(training.get("EPOCHS", 1)), steps, accumulation),
+            code_spec=self._optimizer_spec,
+            inline_lr=float(training.get("LEARNING_RATE", 1e-3)),
+            trusted=self._components_trusted,
+        )
+        self.optimizer_plan = plan
+        return plan
+
+    def _make_optimizer(
+        self, path: str, entry: OptimizerEntry, runtime: Runtime, peer: Peer | None = None
+    ) -> MACTFOptimizer:
+        """Build, finish and bind the facade of one node for one entry.
+
+        ``peer`` binds the facade to a peer the mutation engine has built but not installed.
+        """
+        peer = peer if peer is not None else self.peers[path]
+        module = peer.adapter
+        optimizer = self.optimizer_plan.instantiate(path, entry)
+        training = self._training_settings()
+        explicit = entry.explicit
+        # Precedence, highest first: a per-node override's own key, the constructor argument,
+        # the block, ``TRAINING``. The first two lines are the original code (trainer.py:929-945).
+        if "GRAD_ACCUMULATION" not in explicit:
             if self.grad_accumulation != 1:
                 optimizer.grad_accumulation = self.grad_accumulation
-            elif spec is None and optimizer.grad_accumulation == 1:
-                # TRAINER.GRAD_ACCUMULATION arrives as TRAINING.GRAD_ACCUMULATION
-                # (folded at load). OPTIMIZER.GRAD_ACCUMULATION, when set, already
-                # reached the optimizer through ``from_block`` and is not overridden.
-                configured = int(self._training_settings().get("GRAD_ACCUMULATION", 1) or 1)
+            elif entry.kind != "code" and optimizer.grad_accumulation == 1:
+                configured = int(training.get("GRAD_ACCUMULATION", 1) or 1)
                 if configured > 1:
                     optimizer.grad_accumulation = configured
+        if "MAX_GRAD_NORM" not in explicit:
             if self.max_grad_norm is not None:
                 optimizer.max_grad_norm = self.max_grad_norm
             elif optimizer.max_grad_norm is None:
-                configured = float(
-                    self._training_settings().get("MAX_GRAD_NORM", 0.0) or 0.0
-                )
-                optimizer.max_grad_norm = configured if configured > 0 else None
-            optimizer.scaler = scaler
-            optimizer.node_path = path
-            optimizer.bind(
-                list(module.parameters()),
-                named=list(module.named_parameters()),
-            )
-            self.optimizers[path] = optimizer
-            # The facade replaces the legacy Adam on the peer so that
-            # ``Peer.state_dict`` (and therefore the checkpoint) carries the
-            # optimizer the trainer actually steps.
-            peer.optimizer = optimizer  # type: ignore[assignment]
+                configured_norm = float(training.get("MAX_GRAD_NORM", 0.0) or 0.0)
+                optimizer.max_grad_norm = configured_norm if configured_norm > 0 else None
+        optimizer.scaler = runtime.grad_scaler
+        optimizer.node_path = path
+        optimizer.entry_hash = entry.spec_hash
+        optimizer.bind(list(module.parameters()), named=list(module.named_parameters()))
+        return optimizer
+
+    def _install_optimizer(self, path: str, optimizer: MACTFOptimizer) -> None:
+        self.optimizers[path] = optimizer
+        guard = self._policy_guard
+        if guard is not None:
+            guard.rebind(path, optimizer)      # TRAINER.STEP_GUARD.MAX_GRAD_NORM caps a new optimizer too
+        # The facade replaces the legacy Adam on the peer so ``Peer.state_dict`` carries it.
+        self.peers[path].optimizer = optimizer  # type: ignore[assignment]
+
+    def _bind_optimizers(self, runtime: Runtime) -> None:
+        plan = self._build_optimizer_plan()
+        self._optimizer_warnings = plan.validate(self.node_paths, initial=True)
+        for path in self.peers:
+            entry = plan.select(path)
+            self._verify_optimizer(entry)
+            self._install_optimizer(path, self._make_optimizer(path, entry, runtime))
+            if entry.frozen:
+                self.freeze.add(path, "optimizer:null")
         self._validate_tied_parameters()
 
-    def _validate_tied_parameters(self) -> None:
-        """A tied parameter in two groups cannot receive two blended values."""
+
+    def _verify_optimizer(self, entry: OptimizerEntry) -> None:
+        from .optimizer_plan import verify_entry
+
+        mode = self.optimizer_plan.verify
+        if mode == "off" or entry.spec_hash in self._verified_optimizers:
+            return
+        if mode == "custom" and not entry.customized:
+            return
+        verify_entry(entry)
+        self._verified_optimizers.add(entry.spec_hash)
+
+
+    def swap_optimizer(
+        self, slot: str, block: Mapping[str, Any] | None, *,
+        boundary: Boundary = Boundary.EPISODE, mode: str | None = None,
+    ) -> list[SwapRecord]:
+        """Replace (``block``) or remove (``None``) an optimizer entry, now.
+
+        ``slot`` is ``"OPTIMIZER"`` or ``"OPTIMIZER.<glob>"``. Atomic: on any failure the old
+        optimizers, the plan and the freeze set are exactly as they were.
+        """
+        self._require_built()
+        plan = self.optimizer_plan
+        runtime = self._runtime
+        staged = plan.stage(
+            slot, block, boundary=boundary, node_paths=list(self.peers),
+            live=self.optimizers,
+            make=lambda path, entry: self._make_optimizer(path, entry, runtime),
+            mode=mode,
+        )
+        if staged.entry is not None:           # a replacement entry is probed before it is committed
+            self._verify_optimizer(staged.entry)
+        plan.commit(staged)
+        for path, optimizer in staged.optimizers.items():
+            self._install_optimizer(path, optimizer)
+        for path in staged.frozen:
+            self.freeze.add(path, "optimizer:null")
+        for path in staged.thawed:
+            self.freeze.discard(path, "optimizer:null")
+        self._optimizer_warnings = plan.validate(list(self.peers), initial=False)
+        return list(staged.records)
+
+    def _apply_pending_optimizers(self) -> list[SwapRecord]:
+        applied: list[SwapRecord] = []
+        for slot in self.optimizer_plan.pending_slots():
+            block, mode = self.optimizer_plan.take_pending(slot)
+            try:
+                applied.extend(self.swap_optimizer(slot, block, mode=mode))
+            except Exception as error:  # noqa: BLE001 - a failed queued swap must not end the run
+                self.failures.append(f"queued optimizer swap {slot!r} failed: {error}")
+                log.error("queued optimizer swap %s failed: %s", slot, error)
+        return applied
+
+    def _ensure_optimizer(self, path: str) -> MACTFOptimizer | None:
+        """What ``checkpoint_v2.restore`` calls (``checkpoint_v2.py:1041``) for a node with
+        stored optimizer state and no live optimizer. Fixes O-G8."""
+        peer = self.peers.get(path)
+        if peer is None or self.optimizer_plan is None:
+            return None
+        optimizer = self._make_optimizer(path, self.optimizer_plan.select(path), self._runtime)
+        self._install_optimizer(path, optimizer)
+        return optimizer
+
+    def _validate_tied_parameters(
+        self,
+        *,
+        tree: PeerTree | None = None,
+        peers: Mapping[str, Peer] | None = None,
+        skip: Iterable[str] | None = None,
+    ) -> None:
+        """A tied parameter in two groups cannot receive two blended values.
+
+        The keyword arguments let the mutation engine ask the same question about a tree and a
+        set of peers that are not installed yet, over active members only (M7). With none given
+        it reads the live tree and peers and skips the retired ones, which at build is nobody.
+        """
+        tree = tree if tree is not None else self.tree
+        peers = peers if peers is not None else self.peers
+        skipped = set(skip) if skip is not None else set(self.freeze.retired())
         owners: dict[int, str] = {}
-        for parent, members in aggregation_groups(self.tree):
+        for parent, members in aggregation_groups(tree):
             group = "root" if parent is None else parent
             seen_in_group: dict[int, str] = {}
             for member in members:
-                peer = self.peers.get(member)
+                if member in skipped:
+                    continue
+                peer = peers.get(member)
                 if peer is None:
                     continue
                 for name, parameter in peer.module.named_parameters():
@@ -993,8 +1275,8 @@ class MACTFTrainer:
             return {None: self._kappa}
         controllers: dict[str | None, AdaptiveKappa] = {}
         for parent, members in aggregation_groups(self.tree):
-            controllers[parent] = AdaptiveKappa.from_settings(
-                dict(coopetition), num_peers=max(1, len(members))
+            controllers[parent] = self.kappa_plan.build(
+                group_label(parent), coopetition, num_peers=max(1, len(members))
             )
         return controllers
 
@@ -1004,10 +1286,17 @@ class MACTFTrainer:
         if self._scorers_spec is not None:
             pipeline = build_scorer(self.settings, scorers=_as_scorers(self._scorers_spec))
         else:
-            pipeline = build_scorer(self.settings)
+            # The stage slots live in the trainer's table so a checkpoint can record them.
+            pipeline = build_scorer(
+                self.settings, slots=self.slots, trusted=self._components_trusted
+            )
         if self._hierarchy is not None:
-            return HierarchicalScorer(pipeline)
+            return HierarchicalScorer(pipeline, rollup_source=self._rollup_choice)
         return pipeline
+
+    def _rollup_choice(self) -> Any:
+        """The book's guarded rollup, or ``None`` so the scorer keeps its default."""
+        return self.functions.get("rollup", "")
 
     def _build_task_source(self, training: Mapping[str, Any]) -> Any:
         from ..data.registry import build_source
@@ -1054,6 +1343,21 @@ class MACTFTrainer:
         return dict(self.settings.get("LOSS", {}) or {})
 
     def _resolve_loss(self) -> LossFunction:
+        """The loss ``LOSS``/``loss=`` names, extended with the compliance term (7.8).
+
+        A ``CompositeLoss`` already carries ``compliance_floor``, so the default objective is
+        returned as it is (invariant I1); any other loss goes through ``ensure_compliance``
+        under ``TRAINER.LOSS_COMPLIANCE``.
+        """
+        resolved = self._resolve_loss_unchecked()
+        if isinstance(resolved, CompositeLoss):
+            return resolved
+        mode = str(dict(self.settings.get("TRAINER") or {}).get("LOSS_COMPLIANCE", "require"))
+        return ensure_compliance(
+            resolved, mode=mode.lower(), coefficient=self._compliance_coefficient()
+        )
+
+    def _resolve_loss_unchecked(self) -> LossFunction:
         if self._loss_spec is None:
             block = self._loss_block()
             kind = str(block.get("TYPE", "composite")).lower()
@@ -1131,11 +1435,228 @@ class MACTFTrainer:
         self.stop_requested = True
         self.stop_reason = str(reason or "stop requested")
 
+    @property
+    def active_tree(self) -> PeerTree:
+        """The tree rollout, scoring, training, coordination and aggregation walk (M10).
+
+        ``PeerTree.without`` returns the tree itself when nothing is retired, so a run that never
+        mutates pays nothing and sees nothing different. The view is rebuilt after a commit
+        (``_active_view`` is reset there) and at the top of each epoch.
+        """
+        view = self._active_view
+        if view is None:
+            view = self.tree.without(self.freeze.retired())
+            self._active_view = view
+        return view
+
+    @property
+    def active_node_paths(self) -> tuple[str, ...]:
+        return tuple(node.path for node in self.active_tree.walk("root-first"))
+
+    def _mark_node(self, path: str, status: str) -> None:
+        """Set a node's status on the tree and on the cached view.
+
+        ``without`` shares unchanged node objects, so for almost every node one write is enough.
+        An ancestor that lost a retired child is a copy in the view, and a status written only
+        to the tree would leave the copy ``active`` for the rest of the epoch, so a failed
+        parent would still be trained. Both are written.
+        """
+        self.tree.mark(path, status)
+        view = self._active_view
+        if view is not None and view is not self.tree:
+            node = view.get(path)
+            if node is not None:
+                node.status = status
+
+    # -- tree mutation ---------------------------------------------------
+    def mutate(
+        self, plan: "MutationPlan | Mapping[str, Any] | Sequence[Any]", *, dry_run: bool = False, source: str = "api"
+    ) -> MutationReport:
+        """Apply a plan atomically (12.5). ``dry_run=True`` simulates, stages, reports, installs nothing."""
+        return self.engine.apply(plan, dry_run=dry_run, source=source)
+
+    def preview_mutation(self, plan: "MutationPlan | Mapping[str, Any] | Sequence[Any]") -> MutationReport:
+        return self.engine.apply(plan, dry_run=True, source="preview")
+
+    def request_mutation(
+        self, plan: "MutationPlan | Mapping[str, Any] | Sequence[Any]", *, source: str = "request"
+    ) -> MutationPlan:
+        """Queue a plan for the top of the next epoch. Parsed now, so a malformed plan fails here."""
+        return self.engine.request(plan, source=source)
+
+    def add_peer(self, path: str, *, reason: str = "", **spec: Any) -> MutationReport:
+        return self.mutate(MutationPlan.of(_op_add(path, **spec), label=f"add:{path}", reason=reason))
+
+    def modify_peer(self, path: str, *, reason: str = "", **changes: Any) -> MutationReport:
+        return self.mutate(MutationPlan.of(_op_modify(path, **changes), label=f"modify:{path}", reason=reason))
+
+    def retire_peer(self, path: str, *, recursive: bool = False, reason: str = "") -> MutationReport:
+        return self.mutate(
+            MutationPlan.of(_op_retire(path, recursive=recursive, reason=reason), label=f"retire:{path}", reason=reason)
+        )
+
+    def revive_peer(self, path: str, *, recursive: bool = False, reason: str = "") -> MutationReport:
+        return self.mutate(
+            MutationPlan.of(_op_revive(path, recursive=recursive, reason=reason), label=f"revive:{path}", reason=reason)
+        )
+
+    def purge_peer(
+        self, path: str, *, recursive: bool = False, force: bool = False, reason: str = ""
+    ) -> MutationReport:
+        return self.mutate(
+            MutationPlan.of(
+                _op_purge(path, recursive=recursive, force=force, reason=reason), label=f"purge:{path}", reason=reason
+            )
+        )
+
+    def mutation_history(self) -> list[dict[str, Any]]:
+        """The journal: one entry per committed plan, oldest first, as stored in the checkpoint."""
+        return [dict(entry) for entry in self.mutation_journal]
+
+    def topology(self) -> dict[str, Any]:
+        """What the tree is now: every node with its status, what is retired, what is tombstoned."""
+        self._require_built()
+        retired = self.freeze.retired()
+        return {
+            "topology_epoch": int(self.topology_epoch),
+            "digest": structure_digest(self.tree, retired),
+            "active": len(self.active_tree),
+            "retired": sorted(retired),
+            "tombstones": sorted(self._tombstones),
+            "journal": len(self.mutation_journal),
+            "pending": self.engine.pending(),
+            "nodes": [
+                {
+                    "path": node.path, "role": node.role, "depth": node.depth, "parent": node.parent,
+                    "status": node.status, "retired": node.path in retired,
+                    "children": list(node.children),
+                }
+                for node in self.tree.walk("root-first")
+            ],
+        }
+
+    def mutation_blockers(self) -> list[str]:
+        """Reasons this trainer cannot be mutated at all (checked by ``MutationEngine._gate``)."""
+        reasons: list[str] = []
+        policy = self._trainer_policy if self._trainer_policy is not None else self.distill
+        if self._distillation.enabled and not bool(getattr(policy, "supports_tree_mutation", False)):
+            reasons.append(
+                "DISTILLATION is enabled and CoDistillStep keeps a fixed cohort and fixed teacher "
+                "assignments; a policy that can follow a changing tree sets `supports_tree_mutation = True` "
+                "and implements `on_tree_mutated(trainer, report)`"
+            )
+        return reasons
+
+    # -- the watchdog and the health baselines (12.8) ----------------------
+    def _prune_node(self, path: str, dead_epochs: int = 0) -> int:
+        """``PRUNE_BRANCH`` as a mutation. Returns the number of nodes that left play (0 if none).
+
+        ``TRAINER.MUTATION.WATCHDOG_PRUNE`` decides how: ``purge`` (the default, and what
+        ``remove_node`` always meant), ``retire`` (the branch keeps its weights and can be revived),
+        or ``off`` (the watchdog only reports). A refusal (protected path, last active root, a
+        distillation run) is recorded in ``failures`` and logged; training goes on.
+        """
+        node = self.tree.get(path)
+        if node is None or path in self.freeze.retired():
+            return 0
+        mode = self.mutation_limits.watchdog_prune
+        reason = f"dead branch: no proposals for {int(dead_epochs)} epoch(s)"
+        if mode == "off":
+            self.failures.append(f"watchdog: {path} is dead ({reason}) and WATCHDOG_PRUNE is off")
+            return 0
+        if mode == "retire":
+            op = _op_retire(path, recursive=True, reason=reason)
+        else:
+            op = _op_purge(path, recursive=True, force=True, reason=reason)
+        plan = MutationPlan.of(op, label=f"watchdog:{mode}:{path}", reason=reason)
+        before = len(self.active_tree)
+        try:
+            self.engine.apply(plan, source="watchdog")
+        except MutationError as error:
+            if error.code == "E089" and not error.rolled_back:
+                raise                       # the trainer is unreliable: the run ends (R9)
+            self.failures.append(f"watchdog: could not {mode} {path}: {error}")
+            log.error("watchdog could not %s %s: %s", mode, path, error)
+            return 0
+        return max(0, before - len(self.active_tree))
+
+    def _after_mutation(self, report: MutationReport) -> None:
+        """What the health machinery and the per-peer policies learn from a committed plan.
+
+        Called by ``MutationEngine._finish`` before any user callback (12.7.6).
+        """
+        if report.dry_run or not report.changed:
+            return
+        # The first epoch measured on the new topology. At the top of epoch E (phase ``idle``) the
+        # history holds E results and the next one is E's; in ``observe`` the epoch that just ran
+        # is not in the history yet but belongs to the old topology, so the boundary is one later.
+        self._loss_baseline = len(self.history) + (1 if self._phase == "observe" else 0)
+        # ``_epoch_seconds`` already holds the epoch that just ran when this is called in ``observe``,
+        # and not yet the one about to run when it is called in ``idle``; both give ``len``.
+        self._rate_baseline = len(self._epoch_seconds)
+        grown = tuple(dict.fromkeys((*report.added, *report.rebuilt)))
+        if grown and self._initial_rss is not None:
+            # New parameters, their gradients and optimizer moments are real, and a baseline
+            # taken before them would call them a leak. Memory a purge frees is not credited
+            # back: an allocator rarely returns it, so lowering the baseline would invite the
+            # opposite false alarm.
+            self._initial_rss += self._resident_bytes(grown)
+        for policy in (self._trainer_policy, getattr(self._policy, "inner", self._policy)):
+            hook = getattr(policy, "on_tree_mutated", None)
+            if callable(hook):
+                hook(self, report)
+                break
+        record = getattr(self.logger, "mutation", None)
+        if callable(record):
+            record(report)
+
+    #: Bytes a parameter costs while training: the weight, its gradient, and two Adam moments.
+    _TRAINING_BYTES_PER_PARAMETER_BYTE = 4
+
+    def _resident_bytes(self, paths: Iterable[str]) -> int:
+        total = 0
+        for path in paths:
+            peer = self.peers.get(path)
+            module = getattr(getattr(peer, "adapter", None), "module", None)
+            if module is None:
+                continue
+            total += sum(
+                int(parameter.numel()) * int(parameter.element_size()) for parameter in module.parameters()
+            )
+        return total * self._TRAINING_BYTES_PER_PARAMETER_BYTE
+
+    def _mutation_state(self) -> dict[str, Any]:
+        """The checkpoint's account of how the tree came to be. ``{}`` for a run that never mutated."""
+        pending = self.engine.pending()
+        if not (
+            self.mutation_journal or pending or self._node_specs or self._node_meta or self._tombstones
+        ):
+            return {}
+        return MutationState(
+            journal=tuple(copy.deepcopy(entry) for entry in self.mutation_journal),
+            topology_epoch=int(self.topology_epoch),
+            base_digest=self._base_digest,
+            digest=structure_digest(self.tree, self.freeze.retired()),
+            tombstones=tuple(sorted(self._tombstones)),
+            specs=copy.deepcopy(self._node_specs),
+            metadata=copy.deepcopy(self._node_meta),
+            pending=tuple(pending),
+        ).as_dict()
+
+    def reconcile_topology(
+        self, identity: Mapping[str, Any], tree_state: Mapping[str, Any], *, strict: bool = True
+    ) -> list[str]:
+        """Called by ``MACTFCheckpoint.restore`` before it compares topologies (12.9)."""
+        from .mutation_reconcile import TopologyReconciler
+
+        return TopologyReconciler(self).reconcile(identity, tree_state, strict=strict)
+
     def record_signal_sharing(self, signals_map: Mapping[str, float], *, epoch: int) -> None:
         """Called by ``CooperativeStrategy``: the cohort saw these signals."""
         self.signal_sharing.append(
             {"epoch": int(epoch), "signals": {str(k): float(v) for k, v in signals_map.items()}}
         )
+        del self.signal_sharing[:-64]
 
     # ------------------------------------------------------------------
     # Views the strategies and the checkpoint read
@@ -1151,7 +1672,7 @@ class MACTFTrainer:
     @property
     def peer_names(self) -> tuple[str, ...]:
         if self.tree is not None:
-            return tuple(self.tree.root_paths)
+            return tuple(self.active_tree.root_paths)
         return tuple(self.peers)
 
     @property
@@ -1191,19 +1712,43 @@ class MACTFTrainer:
         except Exception:  # noqa: BLE001 - memory probing is best effort
             return None
 
-    def _attach_distillation(self) -> None:
-        """Install ``CoDistillStep`` as the per-step policy when distillation is on.
+    def _compliance_coefficient(self) -> float:
+        """``TRAINER.COMPLIANCE_COEFFICIENT`` when written, else ``LossConfig.compliance_coef``."""
+        trainer = dict(self.settings.get("TRAINER") or {})
+        if "COMPLIANCE_COEFFICIENT" in trainer:
+            return float(trainer["COMPLIANCE_COEFFICIENT"])
+        return float(self._loss_config().compliance_coef)
 
-        Runs before ``_setup_custom_trainer`` so ``setup`` reaches every peer exactly
-        once. When off, ``_trainer_policy`` is left exactly as the caller set it.
+    def _attach_policy(self) -> None:
+        """Decide the one policy this run uses and attach it (document 17 section 7.5).
+
+        Order, highest first: an in-code ``trainer=`` instance, the ``TRAINER.POLICY`` spec,
+        distillation (``CoDistillStep``), the default. ``resolve_policy`` applies the unsafe
+        flag, the guard and the distillation conflict rule. ``_trainer_policy`` keeps what the
+        caller configured (``None`` for the default step); ``_policy`` is what ``train_step``
+        calls.
         """
-        config = self._distillation
-        if not config.enabled:
-            return
+        from ..components.policy_resolver import resolve_policy
+
+        choice = resolve_policy(
+            code_instance=self._trainer_policy,
+            settings=self.settings,
+            distillation=self._distillation,
+            slots=self.slots,
+            host=self,
+            distill_factory=self._build_distillation_step,
+        )
+        self._trainer_policy = choice.configured
+        self._policy = choice.policy
+        self._policy_origin = choice.origin
+        self._policy_guard = choice.guard
+
+    def _build_distillation_step(self) -> Any:
+        """The former body of ``_attach_distillation``, returning the step."""
         from ..distill import CoDistillStep
 
         policy = CoDistillStep.from_settings(
-            config,
+            self._distillation,
             tree=self.tree,
             optimizers=self.optimizers,
             reference=self.reference,
@@ -1211,7 +1756,34 @@ class MACTFTrainer:
             settings=self.settings,
         )
         policy.attach(self)
-        self._trainer_policy = policy
+        return policy
+
+    def _validate_functions(self) -> None:
+        """``FunctionBook.validate`` against the tree and the policy that now exists."""
+        in_code = [
+            name
+            for name, supplied in (
+                ("synthesis", self._synthesis_spec is not None),
+                ("rollup", self._hierarchical_scorer is not None),
+                ("loss", self._loss_spec is not None),
+            )
+            if supplied
+        ]
+        self._function_warnings = self.functions.validate(
+            self.node_paths,
+            policy=self._policy,
+            hierarchy=self._hierarchy is not None,
+            loss_block_authored=self._loss_block_authored(),
+            in_code=in_code,
+        )
+
+    def _loss_block_authored(self) -> bool:
+        written = authored_keys(self.settings, "LOSS")
+        if written is None:
+            # A plain mapping carries no authorship record: any difference from the shipped
+            # block is the evidence there is.
+            return dict(self.settings.get("LOSS") or {}) != LOSS_DEFAULTS
+        return bool(written)
 
     def _distillation_record(self) -> dict[str, Any]:
         """The JSON-safe resolved config for ``TrainSpec`` (``{}`` when off)."""
@@ -1225,12 +1797,32 @@ class MACTFTrainer:
         return self._distillation
 
     def _setup_custom_trainer(self) -> None:
-        policy = self._trainer_policy
+        policy = self._policy
         setup = getattr(policy, "setup", None)
         if policy is None or not callable(setup):
             return
         for node in self.tree.walk("root-first"):
             setup(node)
+
+    def resolve_node(self, node: Any) -> tuple[PeerNode | None, Peer]:
+        """Public alias of ``_resolve_node``: part of the ``PolicyHost`` surface (7.2)."""
+        return self._resolve_node(node)
+
+    def backward(self, loss: torch.Tensor, optimizer: MACTFOptimizer) -> None:
+        """Scale for accumulation and AMP, then ``backward``: the sanctioned way (7.2)."""
+        self._backward(loss, optimizer)
+
+    def loss_for(self, path: str) -> LossFunction:
+        """The loss in force for ``path``: an ``RL.LOSS`` default or override, else ``LOSS``."""
+        override = self.functions.get("loss", path)
+        return override if override is not None else self.loss_function
+
+    def synthesis_for(self, path: str) -> Any:
+        """The synthesis function in force for the parent ``path``: an ``RL.SYNTHESIS``
+        override or default, else the one built from ``synthesis=`` (``ConsensusSynthesis``
+        when that is unset)."""
+        chosen = self.functions.get("synthesis", path)
+        return chosen if chosen is not None else self.synthesis_function
 
     def _resolve_node(self, node: Any) -> tuple[PeerNode | None, Peer]:
         if isinstance(node, PeerNode):
@@ -1266,7 +1858,7 @@ class MACTFTrainer:
             return 0.0
         values = [
             peer_card.final_score
-            for path in self.tree.root_paths
+            for path in self.active_tree.root_paths
             for card in self._epoch_cards
             for peer_card in [card.peers.get(path)]
             if peer_card is not None
@@ -1312,7 +1904,7 @@ class MACTFTrainer:
         if task is None:
             task = self.task_source.next(self._epoch)
         episode = Episode(index=len(self.episodes), task=task)
-        tree = self.tree
+        tree = self.active_tree
 
         # 1. Delegate, root-first.
         delegation_log: dict[str, dict[str, Any]] = {}
@@ -1369,8 +1961,9 @@ class MACTFTrainer:
                     failed[node.path] = "every selected child failed"
                     self._fail_node(episode, node, failed[node.path])
                     continue
+                synthesizer = self.synthesis_for(node.path)
                 try:
-                    synthesized = self.synthesis_function.synthesize(
+                    synthesized = synthesizer.synthesize(
                         node,
                         proposals,
                         scores=dict(self.signal_by_peer),
@@ -1435,7 +2028,7 @@ class MACTFTrainer:
 
     def _fail_node(self, episode: Episode, node: PeerNode, reason: str) -> None:
         """A failed node is marked, penalised, and skipped for the epoch."""
-        self.tree.mark(node.path, "failed")
+        self._mark_node(node.path, "failed")
         episode.ledger_for(node.path).record(
             "P23", magnitude=1.0, evidence=reason, source="trainer"
         )
@@ -1456,7 +2049,7 @@ class MACTFTrainer:
         evidence = self._episode_evidence(episode)
         if isinstance(scorer, HierarchicalScorer):
             card = scorer.score_tree(
-                self.tree, episode.ledgers, episode=episode.index, evidence=evidence
+                self.active_tree, episode.ledgers, episode=episode.index, evidence=evidence
             )
         else:
             card = scorer.score_episode(
@@ -1510,23 +2103,24 @@ class MACTFTrainer:
         optimizer = self.optimizers.get(path)
         if optimizer is None:
             raise ContractError(f"no optimizer is bound for node {path!r}")
-        policy = self._trainer_policy
-        if policy is None:
-            result = self._builtin_step(peer, optimizer, batch)
+        policy = self._policy
+        handler = getattr(policy, "train_step", None)
+        if callable(handler):
+            raw = handler(tree_node or peer, batch)
+        elif callable(policy):
+            raw = policy(tree_node or peer, batch, trainer=self)
         else:
-            handler = getattr(policy, "train_step", None)
-            if callable(handler):
-                raw = handler(tree_node or peer, batch)
-            elif callable(policy):
-                raw = policy(tree_node or peer, batch, trainer=self)
-            else:
-                raise ContractError("trainer must be a TrainerProtocol or a callable")
-            result = coerce_step_result(raw, node=tree_node or peer)
-            if result.loss.requires_grad:
-                result = self._apply_custom_loss(result, optimizer)
-        if result.metrics and result.metrics.get("pending"):
-            # A rendezvous policy has no cohort result yet; recording its placeholder
-            # zero would pollute the loss history and the epoch mean.
+            raise ContractError("trainer must be a TrainerProtocol or a callable")
+        result = coerce_step_result(raw, node=tree_node or peer)
+        if result.loss.requires_grad and not getattr(policy, "self_stepping", False):
+            result = self._apply_custom_loss(result, optimizer)
+            judge = getattr(policy, "after_step", None)
+            if callable(judge):
+                # A guarded policy checks the step the trainer just took on its behalf.
+                result = judge(tree_node or peer, result)
+        if result.metrics and (result.metrics.get("pending") or result.metrics.get("quarantined")):
+            # A rendezvous policy has no cohort result yet, and a quarantined step has no
+            # loss to record; recording either placeholder would pollute the history.
             return result
         self.global_step += 1
         self.losses.append(result.loss_value)
@@ -1539,70 +2133,6 @@ class MACTFTrainer:
         if grad_norm is not None:
             entry["grad_norm"].append(float(grad_norm))
         return result
-
-    def _builtin_step(
-        self, peer: Peer, optimizer: MACTFOptimizer, batch: Mapping[str, Any]
-    ) -> StepResult:
-        """The policy-gradient step, i.e. ``local_update`` behind the protocol."""
-        runtime = self._runtime
-        states = batch["states"]
-        adapter = peer.adapter
-        adapter.train()
-        if getattr(optimizer, "_accumulated", 0) == 0:
-            optimizer.zero_grad()
-        count = int(states.shape[0])
-        fixed: dict[str, torch.Tensor] = {}
-
-        def evaluate() -> tuple[torch.Tensor, Any]:
-            with autocast(runtime):
-                logits, values = adapter(states)
-            policy = make_policy(logits)
-            with torch.no_grad():
-                ref_logits, _ = self.reference.adapter(states)
-            reference_policy = make_policy(ref_logits)
-            if "actions" not in fixed:
-                # Chosen once so a closure-driven optimizer sees one smooth objective.
-                fixed["actions"] = policy.probs.argmax(dim=-1).detach()
-            signal = torch.full(
-                (count,), float(batch.get("signal", 0.0)),
-                device=logits.device, dtype=logits.dtype,
-            )
-            void = torch.full(
-                (count,), bool(batch.get("void", False)),
-                device=logits.device, dtype=torch.bool,
-            )
-            advantages = penalise_void_advantage(signal, void, floor=-1.0)
-            loss_batch = {
-                "policy": policy,
-                "reference": reference_policy,
-                "actions": fixed["actions"],
-                "advantages": advantages,
-                "values": values,
-                "value_targets": signal.unsqueeze(-1),
-                "compliance_floor": torch.tensor(
-                    float(batch.get("floor", 0.0)), device=logits.device
-                ),
-                "void_mask": void,
-            }
-            return self.loss_function.compute(loss_batch)
-
-        if optimizer.closure_based:
-            total, breakdown = evaluate()
-            outcome = optimizer.step(closure=lambda: evaluate()[0])
-            total, breakdown = evaluate()
-        else:
-            total, breakdown = evaluate()
-            self._backward(total, optimizer)
-            outcome = optimizer.step()
-        metrics = {"lr": float(outcome.lr)}
-        if outcome.grad_norm is not None:
-            metrics["grad_norm"] = float(outcome.grad_norm)
-        return StepResult(
-            loss=total.detach(),
-            breakdown=breakdown,
-            stepped=bool(outcome.stepped),
-            metrics=metrics,
-        )
 
     def _backward(self, loss: torch.Tensor, optimizer: MACTFOptimizer) -> None:
         scaled = loss / optimizer.grad_accumulation if optimizer.grad_accumulation > 1 else loss
@@ -1630,25 +2160,53 @@ class MACTFTrainer:
             metrics=metrics,
         )
 
-    def _stamp_distillation_metadata(self) -> None:
-        """Write ``metadata["distillation"]`` on this epoch's cards, after training.
+    def _stamp_policy_metadata(self) -> None:
+        """Write ``metadata["policy"]`` (and ``["distillation"]``) on this epoch's cards.
 
-        Populated by the trainer after the step, never by a scorer: scoring runs
-        before the cohort step, so a scorer could only report the previous step.
+        Populated by the trainer after the step, never by a scorer: scoring runs before the
+        cohort step, so a scorer could only report the previous step. ``metadata["policy"]``
+        is written for every policy that implements ``card_metadata`` and for an unsafe one
+        (so a card says the step ran unguarded); ``metadata["distillation"]`` is unchanged.
         """
-        policy = self._trainer_policy
+        if not self._epoch_cards:
+            return
+        policy = self._policy
         recorder = getattr(policy, "card_metadata", None)
-        if not self._distillation.enabled or not callable(recorder) or not self._epoch_cards:
+        unsafe = bool(getattr(policy, "unsafe", False))
+        distill = self.distill
+        distill_recorder = getattr(distill, "card_metadata", None)
+        if not callable(recorder) and not unsafe and not (
+            self._distillation.enabled and callable(distill_recorder)
+        ):
             return
         for path, peer_card in self._epoch_cards[-1].peers.items():
-            peer_card.metadata["distillation"] = recorder(path)
+            if self._distillation.enabled and callable(distill_recorder):
+                peer_card.metadata["distillation"] = distill_recorder(path)
+            if callable(recorder) and policy is not distill:
+                payload = dict(recorder(path))
+                if unsafe:
+                    payload["unsafe"] = True
+                peer_card.metadata["policy"] = payload
+            elif unsafe:
+                peer_card.metadata["policy"] = {
+                    "name": getattr(policy, "name", type(policy).__name__), "unsafe": True,
+                }
+
+    def _apply_pending_swaps(self) -> None:
+        """Apply every queued swap an episode boundary permits (functions, then optimizers)."""
+        self.slots.episode = self._epoch
+        if self.optimizer_plan is not None:
+            self.optimizer_plan.episode = self._epoch
+        self.functions.apply_pending(Boundary.EPISODE)
+        if self.optimizer_plan is not None and self.optimizer_plan.pending_slots():
+            self._apply_pending_optimizers()
 
     def _train_epoch(self) -> int:
         """Step 5: walk leaves-first, one or more updates per node."""
         steps = 0
         episode = self.episodes[-1]
-        for node in self.tree.walk("leaves-first"):
-            if node.peer is None or node.status == "failed":
+        for node in self.active_tree.walk("leaves-first"):
+            if node.peer is None or node.status == "failed" or self.freeze.skips_training(node.path):
                 continue
             if node.path not in episode.participants:
                 continue
@@ -1661,7 +2219,7 @@ class MACTFTrainer:
                 replaced = self._dispatch_many("on_step", self, node, result)
                 if isinstance(replaced, StepResult):
                     result = replaced
-                self.strategy.on_peer_step(self, node, result)
+                self.strategy_plan.on_peer_step(self, node, result)
                 steps += 1
         return steps
 
@@ -1676,23 +2234,13 @@ class MACTFTrainer:
             return cached
         controller = self._level_controllers.get(parent)
         if controller is None:
-            children = len(self.tree[parent].children)
-            controller = AdaptiveKappa.from_settings(
-                dict(self._coopetition_settings()), num_peers=max(1, children)
+            children = len(self.active_tree[parent].children)
+            controller = self.kappa_plan.build(
+                parent, dict(self._coopetition_settings()), num_peers=max(1, children)
             )
             self._level_controllers[parent] = controller
             self.controllers[parent] = controller
-        base = self.aggregator
-        aggregator = Aggregator(
-            controller=controller,
-            weight_floor=base.weight_floor,
-            weight_cap=base.weight_cap,
-            confidence_floor=base.confidence_floor,
-            trim_fraction=base.trim_fraction,
-            disagreement_max=base.disagreement_max,
-            fallback_to_reference=base.fallback_to_reference,
-            aggregate_buffers=base.aggregate_buffers,
-        )
+        aggregator = self.aggregator.clone_with(controller)
         self._group_aggregators[parent] = aggregator
         return aggregator
 
@@ -1706,9 +2254,14 @@ class MACTFTrainer:
     ) -> AggregationReport:
         vectors = {name: self.peers[name].export_parameters() for name in members}
         scores = {name: float(self.signal_by_peer.get(name, 0.0)) for name in members}
+        # A frozen peer carries no weight whoever asked (document 17 section 11.4): the freeze
+        # set can only shrink the eligible set. ``None`` when nobody is frozen keeps the call
+        # exactly what it was.
+        frozen = self.freeze.eligible_for(list(members))
         eligible = {
             name: (not self._void(name))
             and bool((external_eligible or {}).get(name, True))
+            and bool((frozen or {}).get(name, True))
             for name in members
         }
         confidence = {name: self._confidence(name) for name in members}
@@ -1716,29 +2269,56 @@ class MACTFTrainer:
         controller = aggregator.controller
 
         def run(chosen: WeightUpdateStrategy) -> AggregationReport:
+            if type(chosen) is KappaSoftmaxAverage:
+                given: tuple[Any, ...] = (vectors, scores, eligible, confidence)
+            else:
+                # Custom code gets its own copies: the guard judges its report against
+                # ``eligible`` and the fallback re-runs on ``vectors``, so a strategy that
+                # edits what it was handed must not be editing the yardstick.
+                given = (
+                    {name: vector.clone() for name, vector in vectors.items()},
+                    dict(scores), dict(eligible), dict(confidence),
+                )
             return chosen.apply(
-                vectors,
-                scores,
+                given[0],
+                given[1],
                 kappa=float(controller.kappa),
                 level=level,
-                eligible=eligible,
-                confidence=confidence,
+                eligible=given[2],
+                confidence=given[3],
             )
 
         reason: str | None = None
         report: AggregationReport | None = None
         is_default = isinstance(strategy, KappaSoftmaxAverage)
-        try:
-            report = run(strategy)
-        except (ComplianceError, NotImplementedError) as error:
-            if is_default:
-                raise
-            reason = str(error) or type(error).__name__
-        if report is not None and report.fallback and not is_default:
-            reason = "it reported fallback"
+        guard = self.weight_guard
+        if guard.covers(strategy, aggregator):
+            snapshot = controller.snapshot()
+            outcome = guard.run(
+                strategy, run,
+                names=sorted(members), eligible=eligible,
+                floor=aggregator.weight_floor, cap=aggregator.weight_cap,
+            )
+            if outcome.action == "fallback":
+                controller.restore(snapshot)                       # invariant A7
+                reason = "; ".join(str(item) for item in outcome.violations)
+            else:
+                report = outcome.report
+        else:
+            try:
+                report = run(strategy)
+            except (ComplianceError, NotImplementedError) as error:
+                if is_default:
+                    raise
+                reason = str(error) or type(error).__name__
+            # An intentional reset (``reference_only``) is not a failure (W-G5).
+            if (report is not None and report.fallback and not is_default
+                    and not traits_of(strategy).may_fallback):
+                reason = "it reported fallback"
         if reason is not None:
             name = getattr(strategy, "name", type(strategy).__name__)
-            report = run(KappaSoftmaxAverage(aggregator))
+            trusted = aggregator if type(aggregator) is Aggregator else aggregator.pristine()
+            report = run(KappaSoftmaxAverage(trusted))
             report.adjustments.append(
                 f"weight_update {name!r} failed: {reason}; fell back to kappa_softmax"
             )
@@ -1755,18 +2335,13 @@ class MACTFTrainer:
     ) -> AggregationReport:
         """Step 6a: the root group's weights, with the documented fallback rule."""
         self._require_built()
-        members = tuple(self.tree.root_paths)
-        report = self._weights_for(
-            None, members, self.aggregator, self.weight_strategy, eligible
-        )
+        members = tuple(self.active_tree.root_paths)
+        strategy = self.weight_plan.strategy_for(ROOT_LABEL, self.aggregator)
+        self.weight_strategy = strategy
+        report = self._weights_for(None, members, self.aggregator, strategy, eligible)
         self.reports.append(report)
         self._epoch_report = report
         return report
-
-    def _group_strategy(self, aggregator: Aggregator) -> WeightUpdateStrategy:
-        if isinstance(self.weight_strategy, KappaSoftmaxAverage):
-            return KappaSoftmaxAverage(aggregator)
-        return self.weight_strategy
 
     def _write(
         self,
@@ -1777,7 +2352,16 @@ class MACTFTrainer:
         reference: Peer | None,
         reference_ema: float,
     ) -> AggregateResult:
+        self.write_count += 1
         adapters = {name: self.peers[name].adapter for name in members}
+        # Readers are every member; writers are the non-frozen ones (document 17 section 11.4).
+        targets = {name: adapter for name, adapter in adapters.items()
+                   if not self.freeze.skips_write(name)}
+        if not targets:
+            report.adjustments.append("every member is frozen; nothing was written")
+            log.warning("W032: group %s skipped: every member is frozen", sorted(members))
+            first = next(iter(adapters.values()))
+            return AggregateResult(parameters=first.export_parameters(), report=report)
         positive = any(weight > 0.0 for weight in report.weights.values())
         if not positive and not report.fallback:
             first = next(iter(adapters.values()))
@@ -1788,12 +2372,42 @@ class MACTFTrainer:
             )
             first = next(iter(adapters.values()))
             return AggregateResult(parameters=first.export_parameters(), report=report)
+        if not report.fallback:
+            # The one place parameters are written: whoever produced ``report`` (a strategy
+            # that built its own, a legacy ``on_epoch_end`` calling ``aggregate(report)``),
+            # a void or frozen peer must not be in the blend.
+            kept = self.freeze.eligible_for(list(members)) or {}
+            barred = [
+                name for name in members
+                if float(report.weights.get(name, 0.0)) > 0.0
+                and (self._void(name) or not bool(kept.get(name, True)))
+            ]
+            if barred:
+                raise WeightGuardViolation("aggregate", [
+                    WeightViolation("U004", name,
+                                    f"carries weight {float(report.weights[name]):.6g} but is "
+                                    "void or frozen; it is never part of a blend")
+                    for name in barred
+                ])
         reference_adapter = reference.adapter if reference is not None else None
-        result = aggregator.aggregate(
-            adapters, report, reference=reference_adapter, device=self._runtime.device
+        custom_blend = type(aggregator).aggregate is not Aggregator.aggregate
+        # A custom ``aggregate`` is shown the peers that carry weight and no others: a blend
+        # that loops over "every adapter" must not be able to read a void peer's parameters.
+        shown = (
+            {name: adapter for name, adapter in adapters.items()
+             if float(report.weights.get(name, 0.0)) > 0.0}
+            if custom_blend and not report.fallback else adapters
         )
+        result = aggregator.aggregate(
+            shown, report, reference=reference_adapter, device=self._runtime.device
+        )
+        if custom_blend and not torch.isfinite(torch.as_tensor(result.parameters)).all():
+            raise ComplianceError(
+                f"aggregator {type(aggregator).__name__} returned non-finite parameters; "
+                "nothing was written"
+            )
         aggregator.apply(
-            adapters,
+            targets,
             result,
             reference=reference_adapter,
             reference_ema=reference_ema if reference is not None else 0.0,
@@ -1801,38 +2415,39 @@ class MACTFTrainer:
             optimizers=None,
         )
         if bool(self._coopetition_settings().get("RESET_OPTIMIZERS", True)):
-            for name in members:
+            for name in targets:
                 _clear_optimizer_state(self.optimizers.get(name))
         return result
 
-    def aggregate(self, report: AggregationReport | None = None) -> AggregateResult:
-        """Step 6b/7: write the root group's blend and update the reference EMA."""
+    def aggregate(
+        self, report: AggregationReport | None = None, *, update_reference: bool = True
+    ) -> AggregateResult:
+        """Step 6b/7: write the root group's blend. ``update_reference=False`` leaves the EMA alone."""
         self._require_built()
         report = report or self._epoch_report or self.update_weights()
         ema = float(self._coopetition_settings().get("REFERENCE_EMA", 0.05))
         result = self._write(
             self.aggregator,
-            tuple(self.tree.root_paths),
+            tuple(self.active_tree.root_paths),
             report,
             reference=self.reference,
-            reference_ema=ema,
+            reference_ema=ema if update_reference else 0.0,
         )
         self._dispatch_many("on_aggregate", self, report)
         return result
 
     def aggregate_group(
-        self, parent: str | None, members: Sequence[str]
+        self,
+        parent: str | None,
+        members: Sequence[str],
+        *,
+        eligible: Mapping[str, bool] | None = None,
     ) -> AggregationReport:
         """Aggregate one child group. The reference is never touched here."""
         self._require_built()
         aggregator = self._group_aggregator(parent)
-        report = self._weights_for(
-            parent,
-            tuple(members),
-            aggregator,
-            self._group_strategy(aggregator),
-            None,
-        )
+        strategy = self.weight_plan.strategy_for(group_label(parent), aggregator)
+        report = self._weights_for(parent, tuple(members), aggregator, strategy, eligible)
         self.reports.append(report)
         self._write(
             aggregator, tuple(members), report, reference=None, reference_ema=0.0
@@ -1841,22 +2456,197 @@ class MACTFTrainer:
         return report
 
     def _coordinate(self, epoch: int) -> AggregationReport | None:
-        """Step 6: let the configured strategy mix (or not) at the epoch's end."""
-        strategy = self.strategy
-        self._epoch_report = None
-        if isinstance(strategy, HierarchicalStrategy):
-            report = self.update_weights()
-            strategy.on_epoch_end(self, epoch, report)
-        elif isinstance(strategy, (KappaSoftmaxStrategy, FrozenPeerStrategy)):
-            # These two drive update_weights and aggregate themselves.
-            strategy.on_epoch_end(self, epoch, None)
-        elif strategy.should_aggregate():
-            report = self.update_weights()
-            self.aggregate(report)
-            strategy.on_epoch_end(self, epoch, report)
+        """Step 6: let the strategy plan mix (or not) at the epoch's end."""
+        return self.strategy_plan.run(self, epoch, self._tree_view())
+
+    # ------------------------------------------------------------------
+    # Weight plan, strategy plan: views, validation and live changes (document 17 sections 10, 11)
+    # ------------------------------------------------------------------
+    def _group_views(self) -> list[GroupView]:
+        coopetition = self._coopetition_settings()
+        floor = float(coopetition.get("WEIGHT_FLOOR", 0.02))
+        cap = float(coopetition.get("WEIGHT_CAP", 0.6))
+        views: list[GroupView] = []
+        for parent, members in aggregation_groups(self.active_tree):
+            views.append(GroupView(
+                label=group_label(parent), parent=parent, members=tuple(members),
+                level=0 if parent is None else int(self.tree[parent].depth),
+                floor=floor, cap=cap,
+            ))
+        return views
+
+    def _validate_weight_plan(self, *, initial: bool) -> None:
+        views = self._group_views()
+        labels = [view.label for view in views]
+        notes = self.weight_plan.validate(views, initial=initial)
+        notes += self.kappa_plan.validate(labels, initial=initial)
+        self.weight_warnings = notes
+        self.failures.extend(note for note in notes if note.startswith("W022"))
+
+    def _tree_view(self) -> TreeView:
+        return tree_view(self.active_tree, hierarchy=self._hierarchy is not None)
+
+    def _validate_strategy_plan(self, *, initial: bool) -> None:
+        view = self._tree_view()
+        plan = self.strategy_plan
+        notes = plan.validate(view, initial=initial)
+        unserved = [
+            group.label for group in view.groups
+            if not group.is_root
+            and plan.select(group.label) == DEFAULT_PATH
+            and not plan.reaches(DEFAULT_PATH, plan.default_instance(), group)
+        ]
+        if unserved and view.hierarchy:
+            notes.append(
+                f"W035: groups {unserved} are served by no strategy: the default "
+                f"{type(plan.default_instance()).__name__} walks the root only; set "
+                "TRAINER.PEER_STRATEGY_OVERRIDES or use a strategy with walk='tree'"
+            )
+        if self.freeze.mode == "legacy" and any(
+            isinstance(instance, FrozenPeerStrategy) for instance in plan.live_instances()
+        ):
+            notes.append(
+                "W034: FrozenPeerStrategy under TRAINER.FREEZE_MODE='legacy': frozen peers still take "
+                "training steps and receive aggregated parameters; set FREEZE_MODE='strict' to freeze them"
+            )
+        self.strategy_warnings = notes
+        for note in notes:
+            if note.startswith(("W034", "W035")):
+                log.warning(note)
+
+    def swap_weight_update(
+        self,
+        glob: str | None,
+        spec: Any,
+        *,
+        boundary: Boundary = Boundary.EPISODE,
+        mode: str | None = None,
+    ) -> SwapRecord | None:
+        """Replace the default strategy (``glob=None``), replace an override, or add one. Now.
+
+        ``spec`` is a name, a mapping, a ``ComponentSpec`` or an in-code instance. Atomic: on
+        any failure the old strategy, its per-group state and the cache are untouched.
+        """
+        self._require_built()
+        record = self.weight_plan.set(
+            glob, spec, views=self._group_views(), boundary=boundary, mode=mode
+        )
+        self.weight_strategy = self.weight_plan.strategy_for(ROOT_LABEL, self.aggregator)
+        self._validate_weight_plan(initial=False)
+        return record
+
+    def remove_weight_override(
+        self, glob: str, *, boundary: Boundary = Boundary.EPISODE
+    ) -> SwapRecord:
+        self._require_built()
+        record = self.weight_plan.remove(glob, views=self._group_views(), boundary=boundary)
+        self.weight_strategy = self.weight_plan.strategy_for(ROOT_LABEL, self.aggregator)
+        self._validate_weight_plan(initial=False)
+        return record
+
+    def request_weight_update(self, glob: str | None, spec: Any, *, mode: str | None = None) -> None:
+        """Queue a replacement for the next episode boundary; an invalid spec fails *now*."""
+        self._require_built()
+        self.weight_plan.request(glob, spec, mode=mode)
+
+    def request_remove_weight_override(self, glob: str) -> None:
+        self._require_built()
+        self.weight_plan.request_remove(glob)
+
+    def _apply_pending_weights(self) -> None:
+        for glob, value, mode in self.weight_plan.take_pending():
+            try:
+                if self.weight_plan.is_removal(value):
+                    self.remove_weight_override(str(glob))
+                else:
+                    self.swap_weight_update(glob, value, mode=mode)
+            except Exception as error:  # noqa: BLE001 - a failed queued swap must not end the run
+                self.failures.append(f"queued weight_update change {glob!r} failed: {error}")
+                log.error("queued weight_update change %r failed: %s", glob, error)
+
+    def legal_report(
+        self, report: AggregationReport, parent: str | None, members: Sequence[str]
+    ) -> list[str]:
+        """Problems that make ``report`` unusable for the group (``Y001``). Empty when legal."""
+        aggregator = self._group_aggregator(parent)
+        eligible = self.freeze.eligible_for(list(members)) or {}
+        flags = {name: (not self._void(name)) and bool(eligible.get(name, True)) for name in members}
+        inspector = WeightGuard(mode="fallback", scope="all", tolerance=self.weight_guard.tolerance)
+        found = inspector.inspect(
+            report, names=sorted(members), eligible=flags,
+            floor=aggregator.weight_floor, cap=aggregator.weight_cap,
+            traits=WeightTraits(may_fallback=True),
+        )
+        return [str(item) for item in found]
+
+    def peer_digest(self, path: str) -> str:
+        """A digest of one peer's parameters; the guard compares it around a call (``Y005``)."""
+        import hashlib
+
+        node = self.tree[path]
+        if node.peer is None:
+            return "none"
+        digest = hashlib.sha256()
+        parameters = node.peer.export_parameters()
+        if isinstance(parameters, Mapping):
+            for name, tensor in sorted(parameters.items()):
+                digest.update(str(name).encode("utf-8"))
+                digest.update(tensor.detach().cpu().numpy().tobytes())
         else:
-            strategy.on_epoch_end(self, epoch, None)
-        return self._epoch_report
+            digest.update(parameters.detach().cpu().numpy().tobytes())
+        return digest.hexdigest()[:16]
+
+    def swap_peer_strategy(
+        self,
+        glob: str | None,
+        spec: Any,
+        *,
+        boundary: Boundary = Boundary.EPISODE,
+        mode: str | None = None,
+    ) -> SwapRecord | None:
+        """Replace the default strategy (``glob=None``), replace one override, or add an override. Now.
+
+        ``spec`` is a name, a mapping, a ``ComponentSpec`` or an in-code instance. Atomic: any
+        failure leaves the old strategy, its state and the freeze set untouched.
+        """
+        self._require_built()
+        record = self.strategy_plan.set(
+            glob, spec, view=self._tree_view(), host=self, boundary=boundary, mode=mode
+        )
+        self.strategy = self.strategy_plan.default_instance()
+        self.failures.extend(self.strategy_plan.drain_errors())
+        self._validate_strategy_plan(initial=False)
+        return record
+
+    def remove_peer_override(
+        self, glob: str, *, boundary: Boundary = Boundary.EPISODE
+    ) -> SwapRecord:
+        self._require_built()
+        record = self.strategy_plan.remove(glob, view=self._tree_view(), host=self, boundary=boundary)
+        self.strategy = self.strategy_plan.default_instance()
+        self.failures.extend(self.strategy_plan.drain_errors())
+        self._validate_strategy_plan(initial=False)
+        return record
+
+    def request_peer_strategy(self, glob: str | None, spec: Any, *, mode: str | None = None) -> None:
+        """Queue a replacement for the next episode boundary; an invalid spec fails *now*."""
+        self._require_built()
+        self.strategy_plan.request(glob, spec, mode=mode)
+
+    def request_remove_peer_override(self, glob: str) -> None:
+        self._require_built()
+        self.strategy_plan.request_remove(glob)
+
+    def _apply_pending_strategies(self) -> None:
+        for glob, value, mode in self.strategy_plan.take_pending():
+            try:
+                if self.strategy_plan.is_removal(value):
+                    self.remove_peer_override(str(glob))
+                else:
+                    self.swap_peer_strategy(glob, value, mode=mode)
+            except Exception as error:  # noqa: BLE001 - a failed queued change must not end the run
+                self.failures.append(f"queued peer_strategy change {glob!r} failed: {error}")
+                log.error("queued peer_strategy change %r failed: %s", glob, error)
 
     # ------------------------------------------------------------------
     # run_epoch and fit
@@ -1864,8 +2654,13 @@ class MACTFTrainer:
     def run_epoch(self, epoch: int) -> EpochResult:
         """One epoch in the fixed order of document 08 section 5.2."""
         self._require_built()
+        if self.engine.poisoned is not None:
+            raise self.engine.poisoned              # a failed rollback ended this trainer (R9)
+        self._phase = "idle"
+        self._epoch = int(epoch)                    # a plan journaled below names this epoch (12.7.4)
+        self._mutations_in_cycle = 0
+        self.engine.apply_pending(int(epoch))       # queued plans, then this epoch's schedule entries
         started = time.monotonic()
-        self._epoch = int(epoch)
         self._epoch_cards = []
         self._epoch_step_losses = []
         self._epoch_node_metrics = {}
@@ -1874,14 +2669,30 @@ class MACTFTrainer:
         for node in self.tree.walk("root-first"):
             if node.status == "failed":
                 self.tree.mark(node.path, "active")
+        self.freeze.sync()          # a frozen peer that failed last epoch is frozen again
+        self._active_view = None    # an ancestor may hold a stale copy of a status
 
+        self._apply_pending_swaps()
+        self._apply_pending_weights()          # 10.8
+        self._apply_pending_strategies()       # 11.9
+        self._phase = "epoch"
+        try:
+            return self._run_epoch_body(epoch, started)
+        finally:
+            self._phase = "idle"
+
+    def _run_epoch_body(self, epoch: int, started: float) -> EpochResult:
         self._dispatch_many("on_epoch_start", self, epoch)
-        self.strategy.on_epoch_start(self, epoch)
+        self.strategy_plan.epoch_start(self, epoch, self._tree_view())
+        self.freeze.check_learners(
+            node.path for node in self.active_tree.walk("root-first")
+            if node.peer is not None and node.status != "failed"
+        )                                       # E075 when nobody would learn
         task = self.task_source.next(epoch)
         self.collect_episode(task)
         self.score()
         steps = self._train_epoch()
-        self._stamp_distillation_metadata()
+        self._stamp_policy_metadata()
         report = self._coordinate(epoch)
 
         losses = self._epoch_step_losses
@@ -1909,10 +2720,9 @@ class MACTFTrainer:
             metrics=metrics,
             completed=True,
         )
-        if self._trainer_policy is not None and callable(
-            getattr(self._trainer_policy, "on_epoch_end", None)
-        ):
-            self._trainer_policy.on_epoch_end(self.tree, result)
+        self._phase = "observe"
+        if self._policy is not None and callable(getattr(self._policy, "on_epoch_end", None)):
+            self._policy.on_epoch_end(self.active_tree, result)
         self._dispatch_many("on_epoch_end", self, result)
         self._observe(result, report)
         self._previous_scores = dict(self.signal_by_peer)
@@ -1937,6 +2747,9 @@ class MACTFTrainer:
                     kappa=float(self.controller.kappa) if self.controller else 0.0,
                     entropy=float(self.controller.entropy) if self.controller else 0.0,
                     aggregations=tuple(self.reports),
+                    # Document 17 section 14: without this a resumed run rebuilt the
+                    # component set of the settings, not the one the file was written with.
+                    identity_extra=self._identity_extra(),
                 ),
                 reason="periodic",
             )
@@ -1957,10 +2770,15 @@ class MACTFTrainer:
         from .watchdog import HealthContext
 
         controller = self.controller
-        roots = max(1, len(self.tree.root_paths))
+        active = self.active_tree
+        roots = max(1, len(active.root_paths))
         elapsed = self._epoch_seconds[-1] if self._epoch_seconds else 0.0
         previous_rate = None
-        if len(self._epoch_seconds) > 1 and self._epoch_seconds[-2] > 0:
+        if (
+            len(self._epoch_seconds) > 1
+            and self._epoch_seconds[-2] > 0
+            and len(self._epoch_seconds) - 2 >= self._rate_baseline     # the previous epoch ran on this topology
+        ):
             previous_rate = result.steps / self._epoch_seconds[-2]
         escalated = sum(
             len(peer_card.warnings_escalated)
@@ -1968,7 +2786,9 @@ class MACTFTrainer:
             for peer_card in card.peers.values()
         )
         dead: dict[str, int] = {}
-        for node in self.tree.walk("root-first"):
+        in_play: set[str] = set()
+        for node in active.walk("root-first"):
+            in_play.add(node.path)
             if node.status == "failed":
                 dead[node.path] = self._dead_counts.get(node.path, 0) + 1
         self._dead_counts = dict(dead)
@@ -1978,12 +2798,13 @@ class MACTFTrainer:
                 count = len(self.checkpoint.list())
             except Exception:  # noqa: BLE001 - a missing directory is zero checkpoints
                 count = 0
+        retired = self.freeze.retired()
         return HealthContext(
             epoch=int(result.epoch),
             step=int(self.global_step),
             losses=tuple(item.mean_loss for item in self.history) + (result.mean_loss,),
             grad_norms=tuple(self.grad_norms),
-            scores=dict(self.signal_by_peer),
+            scores={path: value for path, value in self.signal_by_peer.items() if path in in_play},
             previous_scores=dict(self._previous_scores),
             entropy=float(controller.entropy) if controller else None,
             max_entropy=math.log(roots) if roots > 1 else 0.0,
@@ -1996,11 +2817,16 @@ class MACTFTrainer:
             previous_steps_per_second=previous_rate,
             rss_bytes=self._rss(),
             initial_rss_bytes=self._initial_rss,
-            tree_nodes=len(self.peers),
+            tree_nodes=len(active),
             initial_tree_nodes=self._initial_nodes,
             dead_branches=dead,
             level_durations=dict(self._level_durations),
             extras={"tree": self.tree},
+            loss_baseline=int(self._loss_baseline),
+            retired_nodes=len(retired),
+            mutations=len(self.mutation_journal),
+            topology_epoch=int(self.topology_epoch),
+            pruner=self._prune_node,
         )
 
     def fit(
@@ -2063,6 +2889,7 @@ class MACTFTrainer:
                 "entropy": float(controller.entropy) if controller else None,
                 "seconds": time.monotonic() - self._started_at,
             },
+            component_notes=tuple(self.component_notes),
         )
 
     def _resume(self) -> ResumeReport:
@@ -2097,6 +2924,8 @@ class MACTFTrainer:
         metrics: dict[str, float] = {}
         accuracies: list[float] = []
         for path, peer in self.peers.items():
+            if self.freeze.is_retired(path):
+                continue
             adapter = peer.adapter
             was_training = adapter.training
             adapter.eval()
@@ -2124,7 +2953,7 @@ class MACTFTrainer:
         """Hierarchical (or flat) inference through ``run_inference``."""
         self._require_built()
         return run_inference(
-            self.tree,
+            self.active_tree,
             inputs,
             delegation=self.delegation_policy,
             synthesis=self.synthesis_function,
@@ -2188,7 +3017,7 @@ class MACTFTrainer:
     # Persistence
     # ------------------------------------------------------------------
     def _trainer_state(self) -> dict[str, Any]:
-        return {
+        state: dict[str, Any] = {
             "spec": self.spec.as_dict() if self.spec is not None else {},
             "strategy": self.strategy.state_dict() if self.strategy else {},
             "callbacks": self.callbacks.state_dict(),
@@ -2197,9 +3026,137 @@ class MACTFTrainer:
             "signal_source": self.signal_source,
             "distillation": self._distillation_state(),
         }
+        state.update(self._extension_state())
+        return state
+
+    def _extension_state(self) -> dict[str, Any]:
+        """The trainer-owned state document 17 added, each key only when it has content.
+
+        Written into ``identity["trainer"]`` by :meth:`_trainer_state` and, on their own, by the
+        periodic and watchdog writers (:meth:`_identity_extra`): a resume of a run that swapped
+        an optimizer, a weight update or a peer strategy needs these, and a run that did none
+        of it writes nothing, so a default run's payload is the one it always wrote (I1).
+        """
+        state: dict[str, Any] = {}
+        policy_state = self._policy_state()
+        if policy_state:
+            state["policy"] = policy_state
+        functions = self.functions.state_dict()
+        if functions.get("entries"):
+            state["functions"] = functions
+        plan = self.optimizer_plan
+        if plan is not None and plan.swapped():
+            state["optimizer_plan"] = plan.state_dict()
+        weights = self.weight_plan
+        if weights is not None and (weights.customized() or weights.history()):
+            state["weight_plan"] = weights.state_dict()
+        strategies = self.strategy_plan
+        if strategies is not None and (strategies.customized() or strategies.history()):
+            state["strategy_plan"] = strategies.state_dict()
+        if self.freeze.paths(RETIRED):
+            state["freeze"] = self.freeze.state_dict()
+        mutation = self._mutation_state()
+        if mutation:
+            state["mutation"] = mutation
+        return state
+
+    # ------------------------------------------------------------------
+    # Component manifest (document 17 section 14)
+    # ------------------------------------------------------------------
+    def _identity_extra(self) -> dict[str, Any]:
+        """Keys a checkpoint adds to ``identity``; ``{}`` for a default run (P1).
+
+        * ``trainer``: the extension state of :meth:`_extension_state`;
+        * ``components``: the extensions the run uses (section 14.3).
+
+        * ``engine``: :data:`ENGINE_NAME`, written unconditionally on a built trainer. It is what
+          ``E091`` compares; ``Orchestrator`` writes no ``identity`` at all, so an absent key
+          reads as "orchestrator".
+        """
+        extra: dict[str, Any] = {}
+        if not self.built:
+            return extra
+        state = self._extension_state()
+        if state:
+            extra["trainer"] = state
+        manifest = self._component_manifest()
+        if manifest:
+            extra["components"] = manifest
+        extra["engine"] = ENGINE_NAME
+        return extra
+
+    def _slot_view(self) -> Any:
+        """Every place this run keeps a component, behind ``paths()`` / ``get()``."""
+        from ..components.fingerprint import (
+            SlotView, aggregator_slots, optimizer_slots, reward_term_slots,
+        )
+        from ..components.slots import Slot
+
+        extras: list[Any] = []
+        extras.extend(optimizer_slots(self.optimizer_plan))
+        resolved = self._aggregator_resolved
+        if resolved is None and self._aggregator is not None:
+            try:
+                resolved = self.resolver.adopt(
+                    "aggregator", self._aggregator, name=type(self._aggregator).__name__
+                )
+            except Exception:  # noqa: BLE001 - an instance the contract refuses is not recorded
+                resolved = None
+        extras.extend(aggregator_slots(resolved))
+        chain = tuple(getattr(self.scorer, "chain", ()) or ())
+        extras.extend(reward_term_slots(chain))
+        held = set(self.slots.paths())
+        for stage in chain:
+            path = f"scoring.{stage.kind.value}"
+            if path in held:
+                continue
+            try:
+                adopted = self.resolver.adopt("scorer", stage, name=type(stage).__name__)
+            except Exception:  # noqa: BLE001 - not a component, not recorded
+                continue
+            extras.append(Slot(path=path, kind_id="scorer", resolved=adopted))
+        return SlotView(self.slots, extras)
+
+    def _component_manifest(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """The section 14.3 manifest for this trainer's components; ``{}`` when it has none.
+
+        ``slots`` is created in ``__init__``; a stand-in built without it records nothing
+        rather than failing.
+        """
+        if getattr(self, "slots", None) is None:
+            return {}
+        from ..components.fingerprint import component_manifest
+
+        return component_manifest(self._slot_view())
+
+    def _component_plan(self, stored: Any) -> Any:
+        """The ``RestorePlan`` for this payload; ``absent`` when there is nothing recorded."""
+        from ..components.restore import ComponentRestorer, RestorePlan
+
+        if getattr(self, "slots", None) is None:
+            return RestorePlan(absent=True)
+        return ComponentRestorer(self._slot_view()).plan(stored)
+
+    def _policy_state(self) -> dict[str, Any]:
+        """The active policy's own state, unless it is the distillation step (kept apart)."""
+        policy = self._policy
+        inner = getattr(policy, "inner", policy)
+        if inner is None or (
+            self.distill is not None
+            and (inner is self.distill or getattr(inner, "_step", None) is self.distill)
+        ):
+            return {}
+        getter = getattr(policy, "state_dict", None)
+        if not callable(getter):
+            return {}
+        payload = dict(getter())
+        # A guard's own counters alone are not worth a key: they are rebuilt from zero.
+        if set(payload) == {"inner", "guard"} and not payload["inner"]:
+            return {}
+        return payload
 
     def _distillation_state(self) -> dict[str, Any]:
-        state = getattr(self._trainer_policy, "state_dict", None)
+        state = getattr(self.distill, "state_dict", None)
         if not self._distillation.enabled or not callable(state):
             return {}
         return dict(state())
@@ -2217,23 +3174,52 @@ class MACTFTrainer:
             kappa=float(self.controller.kappa) if self.controller else 0.0,
             entropy=float(self.controller.entropy) if self.controller else 0.0,
             aggregations=tuple(self.reports[-64:]),
+            identity_extra=self._identity_extra(),
         ).resolve()
         payload = self.checkpoint._collect(
             context, episode=self._epoch, step=self.global_step
         )
         data = _detach_clone(payload.as_dict())
+        # ``identity`` already holds ``components`` (section 14); ``trainer`` is the full state,
+        # a superset of the extension keys the periodic writer records.
         data["identity"] = {**dict(data["identity"]), "trainer": self._trainer_state()}
         return data
 
     def load_state_dict(
         self, payload: Mapping[str, Any], *, strict: bool = True
     ) -> ResumeReport:
-        """Restore from a payload produced by :meth:`state_dict` or a checkpoint."""
+        """Restore from a payload produced by :meth:`state_dict` or a checkpoint.
+
+        The component verification, the optimizer and weight plans (before the models move)
+        and the strategy, freeze, callback, policy and function state (after) are applied by
+        :meth:`MACTFCheckpoint.restore` through :meth:`_prepare_restore` and
+        :meth:`_finish_restore`, so ``fit(resume=True)`` and this method restore the same things.
+        """
         self._require_built()
         if self.checkpoint is None:
             raise ImproperlyConfigured("load_state_dict() needs a checkpoint writer")
-        identity = payload.get("identity") if isinstance(payload, Mapping) else payload.identity
-        extra = dict((identity or {}).get("trainer") or {})
+        report = self.checkpoint.restore(payload, trainer=self, strict=strict)
+        self._restored = True
+        self._dispatch_many("on_resume", self, report)
+        return report
+
+    @staticmethod
+    def _extra_of(stored: Any) -> dict[str, Any]:
+        identity = stored.get("identity") if isinstance(stored, Mapping) else stored.identity
+        return dict((identity or {}).get("trainer") or {})
+
+    def _prepare_restore(self, stored: Any, *, strict: bool = True) -> None:
+        """Everything a restore decides before a single parameter moves (document 17 P3).
+
+        The component manifest is verified first: a missing component is discovered here, not
+        after the models were overwritten. Then the signal source, and the optimizer and weight
+        plans of the saved run are re-applied, because they decide which optimizers the
+        checkpoint's optimizer state is loaded into.
+        """
+        plan = self._component_plan(stored)
+        plan.raise_for_errors()
+        self.component_notes = plan.notes()
+        extra = self._extra_of(stored)
         recorded = extra.get("signal_source")
         if recorded and recorded != self.signal_source and strict:
             raise ContractError(
@@ -2241,17 +3227,64 @@ class MACTFTrainer:
                 f"trainer uses {self.signal_source!r}; a resume cannot switch the "
                 "temperature policy mid-run"
             )
-        report = self.checkpoint.restore(payload, trainer=self, strict=strict)
-        if extra.get("strategy"):
+        saved_plan = extra.get("optimizer_plan")
+        if saved_plan and self.optimizer_plan is not None:
+            notes = self.optimizer_plan.load_state_dict(saved_plan, strict=self._strict_restore)
+            self._optimizer_warnings.extend(notes)
+            for path in self.peers:  # the swapped entries may select different optimizers
+                entry = self.optimizer_plan.select(path)
+                current = self.optimizers.get(path)
+                if current is None or getattr(current, "entry_hash", "") != entry.spec_hash:
+                    self._install_optimizer(path, self._make_optimizer(path, entry, self._runtime))
+                    if entry.frozen:
+                        self.freeze.add(path, "optimizer:null")
+        saved_weights = extra.get("weight_plan")
+        if saved_weights and self.weight_plan is not None:
+            weight_notes = self.weight_plan.load_state_dict(saved_weights, strict=self._strict_restore)
+            self.weight_strategy = self.weight_plan.strategy_for(ROOT_LABEL, self.aggregator)
+            self._validate_weight_plan(initial=False)
+            self.weight_warnings.extend(weight_notes)        # after validation, which resets the list
+
+    def _finish_restore(self, stored: Any) -> None:
+        """What the trainer keeps outside the checkpoint's own sections, after they are applied."""
+        extra = self._extra_of(stored)
+        restore_notes: list[str] = []
+        saved_freeze = extra.get("freeze")
+        if saved_freeze:
+            restore_notes.extend(self.freeze.load_state_dict(saved_freeze))
+        saved_strategies = extra.get("strategy_plan")
+        if saved_strategies and self.strategy_plan is not None:
+            before = list(self.strategy_plan.live_instances())
+            restore_notes.extend(
+                self.strategy_plan.load_state_dict(saved_strategies, strict=self._strict_restore)
+            )
+            after = list(self.strategy_plan.live_instances())
+            for gone in before:
+                if not any(gone is kept for kept in after):
+                    try:
+                        gone.detach(self)
+                    except Exception as error:  # noqa: BLE001 - the restore is done; report it
+                        log.error("detach of %s raised: %s", type(gone).__name__, error)
+            for fresh in after:
+                if not any(fresh is old for old in before):
+                    fresh.attach(self)
+            self.strategy = self.strategy_plan.default_instance()
+            self._validate_strategy_plan(initial=False)
+            self.strategy_warnings.extend(restore_notes)     # after validation, which resets the list
+        elif extra.get("strategy"):
             self.strategy.load_state_dict(extra["strategy"])
         if extra.get("callbacks"):
             self.callbacks.load_state_dict(extra["callbacks"])
-        restore = getattr(self._trainer_policy, "load_state_dict", None)
+        restore = getattr(self.distill, "load_state_dict", None)
         if self._distillation.enabled and callable(restore) and extra.get("distillation"):
             self.distillation_resume = restore(extra["distillation"])
-        self._restored = True
-        self._dispatch_many("on_resume", self, report)
-        return report
+        policy_restore = getattr(self._policy, "load_state_dict", None)
+        if extra.get("policy") and callable(policy_restore):
+            policy_restore(extra["policy"])
+        if extra.get("functions"):
+            self._function_warnings.extend(
+                self.functions.load_state_dict(extra["functions"], strict=self._strict_restore)
+            )
 
     # ------------------------------------------------------------------
     # Device moves and shutdown
@@ -2349,18 +3382,8 @@ def _detach_clone(value: Any) -> Any:
 
 def _clear_optimizer_state(optimizer: MACTFOptimizer | None) -> None:
     """Drop momentum computed for pre-aggregation weights."""
-    if optimizer is None:
-        return
-    backend = optimizer.backend
-    backends = (
-        list(getattr(backend, "_backends", {}).values())
-        if hasattr(backend, "_backends")
-        else [backend]
-    )
-    for each in backends:
-        native = getattr(each, "_instance", None)
-        if native is not None:
-            native.state.clear()
+    if optimizer is not None:
+        optimizer.reset_state()
 
 
 class _CheckpointBridge:
@@ -2391,6 +3414,7 @@ class _CheckpointBridge:
                 kappa=float(getattr(context, "kappa", None) or 0.0),
                 entropy=float(getattr(context, "entropy", None) or 0.0),
                 aggregations=tuple(self._trainer.reports),
+                identity_extra=self._trainer._identity_extra(),
             )
         return self._inner.save(
             resolved, reason=reason, episode=episode, step=step, best=best

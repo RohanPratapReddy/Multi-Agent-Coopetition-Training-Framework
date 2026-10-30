@@ -11,6 +11,7 @@ from typing import Any, Callable, ClassVar, Mapping, Protocol, Sequence, runtime
 
 import torch
 
+from ...components.legacy import LegacyTable
 from ...exceptions import ContractError, ValidationError
 from ..advantage import (
     AdvantageBatch,
@@ -443,15 +444,18 @@ class CallableAdvantage(_AdvantageBase):
         return payload
 
 
-ADVANTAGE_FUNCTION_TYPES: dict[str, type] = {
-    "td": TDAdvantage,
-    "gae": GAEAdvantage,
-    "reference": ReferenceBaselineAdvantage,
-    "void_masked": VoidMaskedAdvantage,
-    "normalised": NormalisedAdvantage,
-    "chain": ChainAdvantage,
-    "callable": CallableAdvantage,
-}
+ADVANTAGE_FUNCTION_TYPES: dict[str, type] = LegacyTable(
+    "rl_function.advantage",
+    {
+        "td": TDAdvantage,
+        "gae": GAEAdvantage,
+        "reference": ReferenceBaselineAdvantage,
+        "void_masked": VoidMaskedAdvantage,
+        "normalised": NormalisedAdvantage,
+        "chain": ChainAdvantage,
+        "callable": CallableAdvantage,
+    },
+)
 
 ADVANTAGE_CLASSES = tuple(ADVANTAGE_FUNCTION_TYPES.values())
 

@@ -16,6 +16,7 @@ without it the docx temperature alone could violate them.
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -181,7 +182,35 @@ class AdaptiveKappa:
             "scaled_kappa_init": self.state.scaled_kappa_init,
         }
 
+    def snapshot(self) -> dict[str, Any]:
+        """A deep copy of everything ``step`` mutates, for ``restore`` (invariant A7)."""
+        return {"state": copy.deepcopy(self.state), "num_peers": self.num_peers}
+
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        """Put the controller back exactly as ``snapshot`` found it.
+
+        Fields are copied *into* the existing ``TemperatureState`` so a caller that holds a
+        reference to ``controller.state`` still sees the controller's state.
+        """
+        saved = copy.deepcopy(snapshot["state"])
+        for key, value in vars(saved).items():
+            setattr(self.state, key, value)
+        self.num_peers = int(snapshot["num_peers"])
+
+    def resize(self, num_peers: int) -> None:
+        """Re-target the entropy for a group that gained or lost members (section 12)."""
+        if num_peers < 1:
+            raise ValueError("num_peers must be >= 1")
+        self.num_peers = int(num_peers)
+        max_entropy = math.log(self.num_peers) if self.num_peers > 1 else 0.0
+        self.state.target_entropy = max_entropy * self.target_ratio
+
     def load_state_dict(self, payload: dict[str, Any]) -> None:
+        saved_peers = payload.get("num_peers")
+        if isinstance(saved_peers, int) and not isinstance(saved_peers, bool) and saved_peers >= 1:
+            # The saved target_entropy was computed for this arity; restoring one without the
+            # other makes ``step`` skip its recompute (numel == num_peers) and keep a stale target.
+            self.num_peers = saved_peers
         self.state.kappa = float(payload.get("kappa", self.state.kappa))
         self.state.momentum = float(payload.get("momentum", 0.0))
         self.state.entropy = float(payload.get("entropy", 0.0))

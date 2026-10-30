@@ -1,0 +1,16 @@
+# 18.5: Lion with a step-down; one subtree keeps AdamW.
+COMPONENTS: {MODULES: ["mactf.contrib.components.examples.lion"]}
+OPTIMIZER:
+  TYPE: Lion
+  LR: 3.0e-4
+  WEIGHT_DECAY: 0.01
+  PARAMS: {betas: [0.9, 0.99]}
+  SCHEDULER: step_then_flat
+  SCHEDULER_KWARGS: {drop_at: 500, factor: 0.1}
+  MAX_GRAD_NORM: 1.0
+  MIGRATE: carry
+  OVERRIDES:
+    "peer-2":                              # keeps AdamW and the same scheduler
+      TYPE: torch
+      CLASS: AdamW
+      LR: 1.0e-4

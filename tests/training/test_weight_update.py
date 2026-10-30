@@ -119,13 +119,32 @@ def test_a_failing_strategy_falls_back_and_says_so(tuned, tmp_path):  # noqa: F8
 
 
 def test_a_strategy_that_reports_fallback_is_replaced_and_recorded(tuned, tmp_path):  # noqa: F811
+    """A built-in that reports ``fallback`` without declaring ``may_fallback`` is still replaced.
+
+    ``reference_only`` used to be the example, but its fallback is the *intended* outcome and
+    document 17 section 10.12 (change 1) makes it run: see the next test. The path is reached
+    here with a strategy whose group has no eligible peer.
+    """
+    trainer = make_trainer(tuned, tmp_path, weight_update="uniform", peers=3)
+    trainer.build()
+    trainer._void = lambda path: True                    # every peer voided this epoch
+    trainer.update_weights()
+    report = trainer.reports[-1]
+    assert any("it reported fallback" in line for line in report.adjustments)
+    assert any("uniform" in line for line in report.adjustments)
+
+
+def test_reference_only_resets_to_the_reference_instead_of_being_replaced(tuned, tmp_path):  # noqa: F811
+    """Document 17 section 10.12, change 1: ``reference_only`` declares ``may_fallback``, so it runs."""
     trainer = make_trainer(
         tuned, tmp_path, weight_update=ReferenceOnlyAverage(reference="peer-1"), peers=3
     )
     trainer.fit(epochs=1)
     report = trainer.reports[-1]
-    assert any("it reported fallback" in line for line in report.adjustments)
-    assert any("reference_only" in line for line in report.adjustments)
+    assert report.fallback is True
+    assert report.weights == {"peer-1": 1.0, "peer-2": 0.0, "peer-3": 0.0}
+    assert not any("fell back" in line for line in report.adjustments)
+    assert any("reset to reference peer 'peer-1'" in line for line in report.adjustments)
 
 
 def test_the_default_strategy_never_falls_back_silently(tuned, tmp_path):  # noqa: F811

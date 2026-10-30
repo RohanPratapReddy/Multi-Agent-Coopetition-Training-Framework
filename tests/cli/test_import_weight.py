@@ -42,7 +42,29 @@ def test_command_module_import_is_torch_free(module):
     "from mactf.management.cli import main; main(['help'])",
     "from mactf.management.cli import main; main(['rules', 'list'])",
     "from mactf.management.cli import main; main(['config', 'validate'])",
+    # document 17: the component model is light, and registering a light component stays so
+    "import mactf.components, mactf.components.known",
+    # document 17 section 6: the guard, the reward terms and the chain validator are light too
+    "import mactf.components.guards.compliance, mactf.scoring.reward_terms, "
+    "mactf.scoring.null_stages, mactf.scoring.chain_validation",
+    "from mactf import conf; conf.configure()",
+    "from mactf.components import HUB, register, ComponentKind, overlay\n"
+    "class P:\n    def train_step(self, node, batch): pass\n"
+    "with overlay():\n    register(ComponentKind.TRAINER_POLICY, 'light', P, scope='run')\n"
+    "    assert HUB.registry('trainer_policy').has('light')",
 ])
+
+
 def test_cheap_paths_do_not_import_torch(statements):
     run = _probe(statements)
+    assert run.returncode == 0, run.stderr
+
+
+def test_components_import_pulls_in_no_framework_package():
+    run = _probe(
+        "import mactf.components\n"
+        "loaded = [m for m in sys.modules if m.startswith(('mactf.scoring', 'mactf.coopetition', "
+        "'mactf.rl', 'mactf.training', 'mactf.orchestration'))]\n"
+        "assert not loaded, loaded"
+    )
     assert run.returncode == 0, run.stderr

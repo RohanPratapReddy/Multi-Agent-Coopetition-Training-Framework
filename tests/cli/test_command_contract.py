@@ -13,7 +13,8 @@ from mactf.testing.cli import invoke
 COMMANDS = sorted(get_commands().items())
 IDS = [name for name, _ in COMMANDS]
 # Argument names whose values come from a known set; add a name here when a new one appears.
-KNOWN_SETS = {"run", "status", "injector", "app", "tag", "peer", "rule", "shell", "kind", "key", "topic"}
+KNOWN_SETS = {"run", "status", "injector", "app", "tag", "peer", "rule", "shell", "kind", "key", "topic",
+              "slot"}
 
 
 def _verbs(cls):

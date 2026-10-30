@@ -13,6 +13,7 @@ from typing import Any
 from ...exceptions import CapabilityUnavailable, CommandError, ComplianceError, MACTFError, ResourceNotFound
 from ..group import GroupCommand, Sub
 from ..output import Column
+from ..structured import read_structured
 
 _NAME = re.compile(r"[A-Za-z0-9_.-]+")
 
@@ -83,6 +84,17 @@ class Command(GroupCommand):
                                          "help": "Step the throwaway temperature controller once."})),
             examples=("mactf peers weights --score alpha=0.8 --score beta=0.6 --score gamma=0.2",
                       "mactf peers weights --scores-file scores.json --eligible gamma=false --format json")),
+        Sub("mutate", "Simulate a peer-tree mutation plan, and optionally queue it on a run.",
+            arguments=((("plan",), {"metavar": "FILE", "completer": "file",
+                                    "help": "A MutationPlan as JSON or YAML; '-' reads standard input."}),
+                       (("--run",), {"default": None, "metavar": "RUN_ID", "completer": "run_id",
+                                     "help": "Simulate against this run's live tree instead of the settings."}),
+                       (("--apply",), {"action": "store_true", "default": False,
+                                       "help": "Queue the plan on --run for the next epoch boundary."}),
+                       (("--dry-run",), {"action": "store_true", "default": False,
+                                         "help": "Simulate only, even with --apply; queue nothing."})),
+            examples=("mactf peers mutate plan.yaml",
+                      "mactf peers mutate plan.yaml --run run-0007 --apply")),
     )
 
     def _swarm(self) -> dict[str, Any]:
@@ -208,3 +220,67 @@ class Command(GroupCommand):
                 self.out.result(f"{label}: {', '.join(names)}")
         for line in report["adjustments"]:
             self.out.result(f"  {line}")
+
+    # -- mutate ---------------------------------------------------------------
+    def sub_mutate(self, **options):
+        if options["apply"] and not options["run"]:
+            raise CommandError.usage("--apply needs --run: a plan is queued on a run, not on the settings")
+        raw = read_structured(self, options["plan"], root=(dict, list))
+        if options["run"] is None:
+            report = self._simulate_on_settings(raw)
+            return self._mutation_result(report, queued=None)
+        from ...orchestration.live import manager_for_cli
+        from ...orchestration.runview import resolve_run_id
+
+        registry = self.registry_for_read()
+        if registry is None:
+            raise ResourceNotFound("no runs recorded")
+        run_id = resolve_run_id(registry, options["run"])
+        manager = manager_for_cli(self.need_settings(), registry)
+        report = manager.simulate_mutation(run_id, raw).as_dict()      # RunStateError -> exit 4
+        queued = None
+        if options["apply"] and not options["dry_run"] and report["ok"]:
+            queued = manager.request_mutation(run_id, raw, source="cli")
+        return self._mutation_result(report, queued=queued)
+
+    def _simulate_on_settings(self, raw: Any) -> dict[str, Any]:
+        """Run a plan against a flat tree of the configured peers: nothing is built, nothing trains."""
+        from ...coopetition.aggregation import feasible_bounds
+        from ...coopetition.tree import PeerTree
+        from ...orchestration.live import MutationSimulation
+        from ...training.mutation import MutationLimits, MutationPlan, TopologySimulator
+
+        settings = self.need_settings()
+        names = [str(entry["name"]) for entry in (settings.get("PEERS") or [])
+                 if isinstance(entry, dict) and entry.get("name")]
+        if not names:
+            raise CommandError.usage("the settings configure no peers; pass --run to simulate on a run's tree")
+        coopetition = settings.get("COOPETITION") or {}
+        floor, cap = float(coopetition.get("WEIGHT_FLOOR", 0.02)), float(coopetition.get("WEIGHT_CAP", 0.6))
+        tree = PeerTree.flat(names)
+        limits = MutationLimits.from_settings((settings.get("TRAINER") or {}).get("MUTATION"),
+                                              initial_roots=len(names), initial_nodes=len(names))
+        plan = MutationPlan.parse(raw)
+        simulator = TopologySimulator(tree, retired=(), tombstones=(), limits=limits,
+                                      feasible=lambda count: feasible_bounds(count, floor=floor, cap=cap))
+        return MutationSimulation(plan, simulator.run(plan)).as_dict()
+
+    def _mutation_result(self, report: dict[str, Any], *, queued: dict[str, Any] | None) -> int:
+        payload = {**report, "queued": queued}
+        self.out.emit(payload, text=lambda: self._mutation_text(payload))
+        return 0 if report["ok"] else 1
+
+    def _mutation_text(self, payload: dict[str, Any]) -> None:
+        label = payload.get("label") or "plan"
+        digest = str(payload.get("digest", ""))[:12]
+        self.out.result(f"plan {label} (digest {digest}): {'applicable' if payload['ok'] else 'refused'}")
+        for item in payload["hard"]:
+            self.out.result(f"  {item['code']:7} {item.get('path') or ''} {item['message']}".rstrip())
+        for item in payload["soft"]:
+            self.out.result(f"  {item['code']:7} {item.get('path') or ''} {item['message']}".rstrip())
+        for verb, key in (("add", "added"), ("retire", "retired"), ("revive", "revived"),
+                          ("purge", "purged"), ("modify", "modified")):
+            for path in payload.get(key) or []:
+                self.out.result(f"  ok      {verb} {path}")
+        if payload["queued"]:
+            self.out.result(f"queued {label} for the next epoch boundary (digest {digest})")

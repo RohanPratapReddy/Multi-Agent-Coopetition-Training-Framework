@@ -186,7 +186,10 @@ def test_build_stages_returns_the_three_defaults():
 
 
 def test_registry_lists_the_three_per_node_stages_plus_hierarchy():
-    assert set(SCORER_TYPES) == {"reward", "penalty", "warning", "hierarchy"}
+    # document 17 sections 6.3 and 6.8 add three built-in stage names
+    assert set(SCORER_TYPES) == {
+        "reward", "penalty", "warning", "hierarchy", "composed_reward", "zero_reward", "no_warnings",
+    }
     assert SCORER_TYPES["penalty"] is PenaltyScorer
     # ``hierarchy`` resolves so ``ScorerSpec(type="hierarchy")`` is valid in the
     # API, but it is root-only: a per-node chain may not include it.

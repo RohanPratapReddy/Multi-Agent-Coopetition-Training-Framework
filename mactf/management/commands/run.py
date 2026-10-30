@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from ..base import BaseCommand
 from ..driver import RESUME_AUTO, DriveResult, RunDriver, RunPlan, plan_run, present_run_end
-from ..runsupport import device_arg, duration_arg, positive_int, run_id_arg
+from ..runsupport import add_component_modules, device_arg, duration_arg, positive_int, run_id_arg
 
 
 class Command(BaseCommand):
@@ -49,6 +49,9 @@ class Command(BaseCommand):
         (("--log-file",), {"default": None, "metavar": "PATH",
                            "help": "Write the per-run JSONL log here instead of the default location."}),
         (("--no-log",), {"action": "store_true", "default": False, "help": "Write no per-run log."}),
+        (("--component-module",), {"action": "append", "default": None, "metavar": "MODULE",
+                                   "dest": "component_modules",
+                                   "help": "Import MODULE and register its components for this run; repeat it."}),
     ]
     exclusive = (
         ("--resume", "--branch-from", "--dry-run"),
@@ -58,6 +61,7 @@ class Command(BaseCommand):
 
     def handle(self, **options):
         settings = self.need_settings()
+        add_component_modules(settings, options.get("component_modules"))
         if (settings.get("ORCHESTRATOR") or {}).get("ANNOUNCE"):
             for note in settings.get("_CONF_NOTES") or []:
                 self.out.info(f"  conf     : {note}")

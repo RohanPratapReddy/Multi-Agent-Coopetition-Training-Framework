@@ -58,6 +58,46 @@ class Harness:
         self.peers = modules
         return Orchestrator(self.settings, modules=modules)
 
+    def engine(self, count: int = 2, engine: str = "trainer", **blocks: Any) -> Any:
+        """The configured engine over a *copy* of the settings (document 17 sections 13.10, 19.2).
+
+        ``engine`` is ``"orchestrator"`` or ``"trainer"``; it is written to ``ORCHESTRATOR.ENGINE``
+        on the copy, so the shared ``settings`` is never edited and one scenario can be run under
+        both engines. ``blocks`` are settings blocks merged into the copy
+        (``TRAINER={"MUTATION": {...}}``); nested mappings merge key by key.
+        """
+        from ..orchestration.dispatch import engine_factory
+
+        copied = Settings(self.settings.as_dict(), module=self.settings.module)
+        copied["ORCHESTRATOR"] = {**dict(copied.get("ORCHESTRATOR") or {}), "ENGINE": engine}
+        for name, value in blocks.items():
+            _merge_block(copied, str(name).upper(), value)
+        conf.validate_settings(copied)
+        modules = {
+            f"peer{index}": ToyPeer(
+                state_dim=int(copied["TRAINING"]["STATE_DIM"]),
+                action_dim=int(copied["TRAINING"]["ACTION_DIM"]),
+            )
+            for index in range(count)
+        }
+        self.peers = modules
+        return engine_factory(copied, modules=modules)
+
+
+def _merge_block(settings: Settings, name: str, value: Any) -> None:
+    """Merge ``value`` into ``settings[name]`` key by key (a non-mapping replaces)."""
+    current = settings.get(name)
+    if isinstance(current, dict) and isinstance(value, dict):
+        merged = dict(current)
+        for key, item in value.items():
+            if isinstance(merged.get(key), dict) and isinstance(item, dict):
+                merged[key] = {**merged[key], **item}
+            else:
+                merged[key] = item
+        settings[name] = merged
+    else:
+        settings[name] = value
+
 
 def build_harness(
     *,

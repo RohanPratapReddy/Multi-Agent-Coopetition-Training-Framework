@@ -651,7 +651,12 @@ class Serializer:
         self.many = bool(many)
         self._errors: Any = None
         self._validated: Any = _UNSET
-        self.__class__._get_fields()  # resolve declarations eagerly, failing early
+        for field in self.__class__._get_fields().values():
+            # A field whose choices come from a live registry re-reads them per instance
+            # (document 17 section 16.3.2); every other field class has no ``refresh``.
+            refresh = getattr(field, "refresh", None)
+            if callable(refresh):
+                refresh()
 
     # -- declaration ------------------------------------------------------------
     @classmethod

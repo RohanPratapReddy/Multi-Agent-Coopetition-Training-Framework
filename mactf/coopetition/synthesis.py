@@ -17,6 +17,7 @@ Shape rules are enforced before returning (document 10 section 4.2):
 
 from __future__ import annotations
 
+import inspect
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Mapping, Sequence
 
@@ -36,7 +37,9 @@ __all__ = [
     "LearnedSynthesizer",
     "SYNTHESIS_TYPES",
     "SynthesisFunction",
+    "TensorSynthesisAdapter",
     "WeightedConsensus",
+    "adapt_synthesis",
     "build_synthesis",
     "check_aligned",
     "synthesis_capabilities",
@@ -298,6 +301,8 @@ class ConcatSynthesis(SynthesisFunction):
     """
 
     name = "concat"
+    #: The trailing shape legitimately changes, so the contract probe must not demand it back.
+    output_shape_rule = "free"
 
     def __init__(self, *, dim: int = -1) -> None:
         self.dim = int(dim)
@@ -326,6 +331,144 @@ class ConcatSynthesis(SynthesisFunction):
 
 
 # ---------------------------------------------------------------------------
+# The bridge to the tensor-level registry (document 17 section 8.7)
+# ---------------------------------------------------------------------------
+_ADAPTER_KEYWORDS = ("weights", "scores", "node", "task")
+
+
+def _accepted_keywords(function: Any) -> tuple[frozenset[str], bool]:
+    """The keyword names ``function`` declares among the four the adapter can offer, and
+    whether it takes ``**kwargs``. Unknown signatures (builtins) are treated as ``weights``
+    only, the protocol's one keyword."""
+    try:
+        signature = inspect.signature(function)
+    except (TypeError, ValueError):
+        return frozenset({"weights"}), False
+    names: set[str] = set()
+    var_keyword = False
+    for name, parameter in signature.parameters.items():
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            var_keyword = True
+        elif parameter.kind in (inspect.Parameter.KEYWORD_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            if name in _ADAPTER_KEYWORDS:
+                names.add(name)
+    return frozenset(names), var_keyword
+
+
+class TensorSynthesisAdapter(SynthesisFunction):
+    """A tensor-level function (``__call__(proposals, *, weights=None)``) as a node-level one.
+
+    Offered to the function, by keyword, when it declares them: ``weights`` (always, if it
+    takes ``weights`` or ``**kwargs``), ``scores``, ``node`` and ``task``. A function that
+    declares only ``proposals`` and ``weights`` is the common case and gets exactly the
+    protocol call. ``weights`` is the kappa weight map when the trainer has one, else the
+    child scores: a tensor-level function has one weight argument, and "how much to trust each
+    child" is what both of them mean.
+    """
+
+    name = "tensor"
+
+    def __init__(self, function: Any, *, name: str | None = None) -> None:
+        if not callable(function):
+            raise ValidationError(f"TensorSynthesisAdapter needs a callable, got {function!r}")
+        rule = str(getattr(function, "output_shape_rule", "same"))
+        if rule not in ("same", "free"):
+            raise ValidationError(
+                f"output_shape_rule must be 'same' or 'free', got {rule!r} on {type(function).__name__}"
+            )
+        self.function = function
+        self.name = str(name or getattr(function, "name", None) or type(function).__name__)
+        self.output_shape_rule = rule
+        self._keywords, self._var_keyword = _accepted_keywords(function)
+
+    def synthesize(self, node, proposals, *, scores=None, weights=None, task=None):
+        if not proposals:
+            raise ContractError(f"no proposals to synthesize for {node.path}")
+        if self.output_shape_rule == "same":
+            check_aligned(proposals, node=node.path)
+        else:
+            batch = None
+            for path, tensor in proposals.items():
+                if not torch.is_tensor(tensor):
+                    raise ContractError(
+                        f"synthesis at {node.path}: proposal from {path!r} is a "
+                        f"{type(tensor).__name__}, not a tensor"
+                    )
+                size = int(tensor.shape[0]) if tensor.dim() else -1
+                if batch is None:
+                    batch = size
+                elif size != batch:
+                    raise ContractError(
+                        f"synthesis at {node.path}: proposal from {path!r} has batch {size}, "
+                        f"expected {batch}"
+                    )
+        offered: dict[str, Any] = {}
+        if "weights" in self._keywords or self._var_keyword:
+            merged = dict(weights) if weights else (dict(scores) if scores else None)
+            offered["weights"] = merged
+        if "scores" in self._keywords:
+            offered["scores"] = dict(scores or {})
+        if "node" in self._keywords:
+            offered["node"] = node
+        if "task" in self._keywords:
+            offered["task"] = task
+        result = self.function(dict(proposals), **offered)
+        if not torch.is_tensor(result):
+            raise ContractError(
+                f"synthesis {self.name!r} returned {type(result).__name__}, expected a tensor"
+            )
+        first = next(iter(proposals.values()))
+        if result.dim() == 0 or int(result.shape[0]) != int(first.shape[0]):
+            raise ContractError(
+                f"synthesis {self.name!r} at {node.path} returned shape {tuple(result.shape)}; "
+                f"the leading dimension must be the batch ({int(first.shape[0])})"
+            )
+        if self.output_shape_rule == "same" and tuple(result.shape) != tuple(first.shape):
+            raise ContractError(
+                f"synthesis {self.name!r} at {node.path} returned shape {tuple(result.shape)}; "
+                f"expected {tuple(first.shape)} (declare output_shape_rule = 'free' to change it)"
+            )
+        if not bool(torch.isfinite(result).all()):
+            raise ContractError(f"synthesis {self.name!r} at {node.path} returned a non-finite value")
+        return result
+
+    # A learned tensor-level function owns parameters; expose them the way
+    # ``LearnedSynthesizer`` (this module, line 221) does.
+    def parameters(self):
+        getter = getattr(self.function, "parameters", None)
+        return tuple(getter()) if callable(getter) else ()
+
+    def train(self, mode: bool = True):
+        setter = getattr(self.function, "train", None)
+        if callable(setter):
+            setter(mode)
+        return self
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            **super().describe(),
+            "type": self.name,
+            "function": type(self.function).__name__,
+            "output_shape_rule": self.output_shape_rule,
+        }
+
+
+def adapt_synthesis(candidate: Any, *, name: str | None = None) -> SynthesisFunction:
+    """Return a node-level function for ``candidate`` (a node-level object, or a tensor-level one)."""
+    if isinstance(candidate, SynthesisFunction) or callable(getattr(candidate, "synthesize", None)):
+        return candidate
+    if inspect.isfunction(candidate) or inspect.ismethod(candidate) or inspect.isbuiltin(candidate):
+        raise ValidationError(
+            "a bare function is ambiguous between the tensor-level and node-level synthesis "
+            "protocols; wrap it with ExplicitSynthesis(fn) for the node-level call, or register "
+            "a class under rl_function.synthesis"
+        )
+    if callable(candidate):
+        return TensorSynthesisAdapter(candidate, name=name)
+    raise ContractError(f"{type(candidate).__name__} is not a synthesis function")
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 SYNTHESIS_TYPES: dict[str, type[SynthesisFunction]] = {
@@ -344,51 +487,90 @@ _ALIASES = {
 }
 
 
-def build_synthesis(spec: Mapping[str, Any] | str | None) -> SynthesisFunction:
-    """Resolve a function from a name or a ``{"type": ..., **kwargs}`` spec."""
+def build_synthesis(spec: Mapping[str, Any] | str | SynthesisFunction | Any | None) -> SynthesisFunction:
+    """Resolve a function from a name, a ``{"type": ..., **kwargs}`` spec, or an instance.
+
+    Order: the node-level built-ins, then ``rl_function.synthesis`` (tensor-level or
+    node-aware custom components), then an error that lists both. A custom component whose
+    name equals a node-level built-in is refused (``E046``) instead of being silently
+    shadowed.
+    """
+    from ..components import HUB
+    from ..components.kinds import Origin
+
     if spec is None:
         return ConsensusSynthesis()
     if isinstance(spec, str):
         payload: dict[str, Any] = {"type": spec}
-    elif isinstance(spec, SynthesisFunction):
-        return spec
-    else:
+    elif isinstance(spec, Mapping):
         payload = dict(spec)
+    else:
+        return adapt_synthesis(spec)
+    registry = HUB.registry("rl_function.synthesis")
+
+    if "import" in payload:
+        from ..rl.functions.registry import build_function
+
+        return adapt_synthesis(build_function(payload, family="synthesis"), name=str(payload["import"]))
+
     type_name = payload.pop("type", None)
     if type_name is None:
         raise ValidationError(
             "a synthesis spec requires a 'type' key; accepted types: "
-            + ", ".join(sorted(SYNTHESIS_TYPES))
+            + ", ".join(sorted(set(SYNTHESIS_TYPES) | set(registry.names())))
         )
     type_name = _ALIASES.get(str(type_name), str(type_name))
-    if type_name not in SYNTHESIS_TYPES:
-        raise ValidationError(
-            f"unknown synthesis type {type_name!r}; accepted types: "
-            + ", ".join(sorted(SYNTHESIS_TYPES))
-        )
-    cls = SYNTHESIS_TYPES[type_name]
-    accepted = _constructor_keys(cls)
-    unknown = sorted(set(payload) - accepted)
-    if unknown:
-        raise ValidationError(
-            f"{cls.__name__} does not accept "
-            + ", ".join(repr(key) for key in unknown)
-            + f"; accepted keys: {', '.join(sorted(accepted)) or '(none)'}"
-        )
-    return cls(**payload)
+    registered = registry.find(type_name)
+
+    if type_name in SYNTHESIS_TYPES:
+        if registered is not None and registered.origin is not Origin.BUILTIN:
+            raise ValidationError(
+                f"E046: synthesis type {type_name!r} names both a node-level built-in and a "
+                f"custom rl_function.synthesis component ({registered.origin.value}); the "
+                "built-in would silently win. Register the custom function under another name."
+            )
+        cls = SYNTHESIS_TYPES[type_name]
+        accepted = _constructor_keys(cls)
+        unknown = sorted(set(payload) - accepted)
+        if unknown:
+            raise ValidationError(
+                f"{cls.__name__} does not accept "
+                + ", ".join(repr(key) for key in unknown)
+                + f"; accepted keys: {', '.join(sorted(accepted)) or '(none)'}"
+            )
+        return cls(**payload)
+
+    if registered is not None:
+        return adapt_synthesis(registry.build(type_name, payload), name=type_name)
+    raise ValidationError(
+        f"unknown synthesis type {type_name!r}; accepted types: "
+        + ", ".join(sorted(set(SYNTHESIS_TYPES) | set(registry.names())))
+    )
 
 
+# synthesis_capabilities() (line 381): node-level entries gain "level": "node"; one entry per
+# registered component that is not already a node-level name is appended:
 def synthesis_capabilities() -> list[dict[str, Any]]:
+    from ..components import HUB
+
     entries: list[dict[str, Any]] = []
     for name in sorted(SYNTHESIS_TYPES):
         cls = SYNTHESIS_TYPES[name]
-        entries.append(
-            {
-                "type": name,
-                "class": cls.__name__,
-                "kwargs": sorted(_constructor_keys(cls)),
-            }
-        )
+        entries.append({
+            "type": name, "class": cls.__name__, "kwargs": sorted(_constructor_keys(cls)),
+            "level": "node", "origin": "builtin",
+        })
+    for component in HUB.registry("rl_function.synthesis").components():
+        if component.name in SYNTHESIS_TYPES:
+            continue
+        node_aware = callable(getattr(component.factory, "synthesize", None))
+        entries.append({
+            "type": component.name,
+            "class": getattr(component.factory, "__name__", component.qualname),
+            "kwargs": sorted(component.accepted_params()),
+            "level": "node" if node_aware else "tensor",
+            "origin": component.origin.value,
+        })
     return entries
 
 

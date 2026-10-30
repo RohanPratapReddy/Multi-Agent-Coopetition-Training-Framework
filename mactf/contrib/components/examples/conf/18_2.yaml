@@ -1,0 +1,10 @@
+# 18.2: a reward term with diminishing returns on one rule family.
+COMPONENTS: {MODULES: ["mactf.contrib.components.examples.sqrt_magnitude"]}
+SCORING:
+  STAGES:
+    reward:
+      type: composed_reward
+      params:
+        terms:
+          - {type: severity_scaled, weight: 1.0, params: {rules: [R1, R2, R3]}}
+          - {type: sqrt_magnitude, weight: 0.5, params: {scale: 2.0, rules: [R10, R11]}}

@@ -1,6 +1,6 @@
 ---
 title: Component Customization — Add, Modify, Create, Replace and Delete Training Policies, Scorers, Optimizers, Weight Updates, Peer Strategies, RL Functions and Peers
-status: approved-for-implementation
+status: implemented
 version: 1.0.0
 applies_to: mactf >= 0.1.0
 owner: mactf-core

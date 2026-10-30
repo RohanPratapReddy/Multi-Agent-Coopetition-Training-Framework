@@ -1,0 +1,4 @@
+label: restore-peer-3
+ops:
+  - {op: revive, path: peer-3}
+  - {op: modify, path: peer-3, set: {optimizer: {LR: 5.0e-5}}}

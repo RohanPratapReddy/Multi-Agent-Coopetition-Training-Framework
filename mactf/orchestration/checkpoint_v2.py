@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging as _logging
 import os
 import platform
 import random
@@ -36,8 +37,12 @@ import torch
 
 from .. import signals
 from ..exceptions import ComplianceError, ImproperlyConfigured, ValidationError
+from ..components.fingerprint import IDENTITY_KEY
+from ..coopetition.tree import PeerTree
 from ..runtime import atomic_torch_save, load_checkpoint
 from .checkpoint import CheckpointRecord
+
+log = _logging.getLogger("mactf.checkpoint")
 
 __all__ = [
     "CheckpointContext",
@@ -82,6 +87,9 @@ class CheckpointContext:
     entropy: float = 0.0
     mode: str = "train"
     extras: Mapping[str, Any] = field(default_factory=dict)
+    #: Keys added to ``identity`` (document 17 sections 12.7 and 14): the components the run
+    #: uses, and the trainer-owned state a plain resume needs. May not replace a framework key.
+    identity_extra: Mapping[str, Any] = field(default_factory=dict)
 
     def resolve(self) -> "CheckpointContext":
         """Fill missing fields from the trainer, without overwriting anything set."""
@@ -111,6 +119,14 @@ class CheckpointContext:
             self.task_source = get("task_source")
         if self.settings is None:
             self.settings = get("settings")
+        if not self.identity_extra:
+            # Every writer (periodic, watchdog, ``state_dict``, a hand-built context) asks the
+            # same function, so the file and ``runs.components_json`` cannot disagree (P6).
+            # Looked up on the class: a stand-in object that merely answers every attribute
+            # (a mock) must not be taken for a trainer.
+            extra = getattr(type(trainer), "_identity_extra", None)
+            if callable(extra):
+                self.identity_extra = dict(extra(trainer))
         return self
 
 
@@ -286,6 +302,8 @@ class ResumeReport:
     bit_identical_expected: bool = False
     duration: float = 0.0
     notes: tuple[str, ...] = ()
+    #: What the component verification of document 17 section 14.5 said: ``W052``, ``W053``.
+    component_notes: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -303,6 +321,7 @@ class ResumeReport:
             "bit_identical_expected": self.bit_identical_expected,
             "duration": self.duration,
             "notes": list(self.notes),
+            **({"component_notes": list(self.component_notes)} if self.component_notes else {}),
         }
 
     def describe(self) -> str:
@@ -449,6 +468,9 @@ class MACTFCheckpoint:
         #: The path an in-flight resume is using; never pruned (section 4.7).
         self._in_flight: Path | None = None
         self.last_sections: tuple[str, ...] = ()
+        #: Whether ``runs.components_json`` holds a manifest this writer put there (or a
+        #: resume found in the file), so an emptied manifest is written back as ``NULL``.
+        self._components_recorded = False
 
     # -- construction ----------------------------------------------------
     @classmethod
@@ -566,6 +588,7 @@ class MACTFCheckpoint:
             score=float(ctx.score or 0.0),
         )
         self._record_in_registry(record)
+        self._record_components(payload)
         signals.checkpoint_written.send(sender=self, record=record, payload=payload.as_dict())
         self.last_sections = tuple(sorted(sections))
         self._prune_internal(reason=reason)
@@ -593,6 +616,12 @@ class MACTFCheckpoint:
             "mode": str(context.mode),
             "score": float(context.score or 0.0),
         }
+        for key, value in dict(context.identity_extra or {}).items():
+            if key in identity:
+                raise ImproperlyConfigured(
+                    f"identity_extra may not replace the framework's identity key {key!r}"
+                )
+            identity[key] = value
 
         tree = None
         if context.tree is not None and hasattr(context.tree, "state_dict"):
@@ -742,6 +771,30 @@ class MACTFCheckpoint:
             raise ImproperlyConfigured(
                 f"checkpoint written to {record.path} but the registry rejected it: {error}"
             ) from error
+
+    def _record_components(self, payload: CheckpointPayload) -> None:
+        """Keep ``runs.components_json`` equal to the manifest this file was written with.
+
+        A registry without the method (an app that supplies its own) is not an error: the file
+        remains authoritative, which is the rule for every other registry write in
+        ``_record_in_registry``. A run that never recorded a manifest and still has none costs
+        no registry call at all (a default run).
+        """
+        manifest = dict(payload.identity.get(IDENTITY_KEY) or {})
+        if not manifest and not self._components_recorded:
+            return
+        recorder = getattr(self.registry, "record_components", None)
+        if not callable(recorder):
+            return
+        try:
+            recorder(self.run_id, manifest or None, source="checkpoint")
+        except ImproperlyConfigured:
+            # ``start_run`` never ran (a bare ``state_dict()`` in a script), or the registry is
+            # behind schema 4. The file is written and correct; there is simply no row (or
+            # column) to attach it to.
+            log.debug("no run row for %s; components recorded in the file only", self.run_id)
+            return
+        self._components_recorded = bool(manifest)
 
     # -- listing ---------------------------------------------------------
     def list(self, *, valid_only: bool = False) -> list[CheckpointRecord]:
@@ -913,7 +966,12 @@ class MACTFCheckpoint:
             if isinstance(state, Mapping):
                 adapter_state = state.get("adapter")
                 if isinstance(adapter_state, Mapping):
-                    models[str(name)] = adapter_state
+                    # ``PeerAdapter.state_dict`` prefixes every key with ``module.``; a v2 ``models``
+                    # entry is the module's own state dict (document 17 section 13.4.8).
+                    models[str(name)] = {
+                        (key[len("module."):] if str(key).startswith("module.") else key): value
+                        for key, value in adapter_state.items()
+                    }
                 else:
                     models[str(name)] = {
                         key: value for key, value in state.items() if torch.is_tensor(value)
@@ -927,7 +985,7 @@ class MACTFCheckpoint:
         }
         return {
             "identity": identity,
-            "tree": {"peers": {name: {} for name in peers}},
+            "tree": PeerTree.flat([str(name) for name in peers]).state_dict(),
             "models": models,
             "reference": raw.get("reference"),
             "adapters": None,
@@ -972,6 +1030,15 @@ class MACTFCheckpoint:
         episode = int(identity.get("episode", 0))
         global_step = int(identity.get("global_step", 0))
 
+        # Document 17 section 14.5 (P3): the components are verified, and the plans that decide
+        # which optimizer and weight update the saved run was using are re-applied, before a
+        # single parameter moves. Looked up on the class: only a real trainer has the hooks.
+        prepare = getattr(type(trainer), "_prepare_restore", None) if trainer is not None else None
+        if callable(prepare):
+            prepare(trainer, stored, strict=strict)
+        if IDENTITY_KEY in identity:
+            self._components_recorded = True
+
         # 3. identity check.
         run_id = str(identity.get("run_id", ""))
         if run_id and run_id != self.run_id:
@@ -986,6 +1053,12 @@ class MACTFCheckpoint:
             # 4. topology.
             tree_state = stored.tree
             trainer_tree = getattr(trainer, "tree", None)
+            # Document 17 section 12.9: a trainer that can mutate first reproduces the stored
+            # structure, so the comparison below is the last line of defence and not the only
+            # check. ``Orchestrator`` has no ``reconcile_topology``: it never mutates.
+            reconcile = getattr(type(trainer), "reconcile_topology", None)   # the class: a mock has no hook
+            if callable(reconcile) and tree_state and trainer_tree is not None:
+                notes.extend(reconcile(trainer, identity, tree_state, strict=strict))
             if tree_state and trainer_tree is not None:
                 from ..coopetition.tree import PeerTree
 
@@ -1079,11 +1152,13 @@ class MACTFCheckpoint:
             controllers = dict(getattr(trainer, "controllers", {}) or {})
             root_controller = getattr(trainer, "controller", None)
             for name, state in sorted((stored.kappa or {}).items()):
-                controller = (
-                    root_controller
-                    if name == "root"
-                    else controllers.get(name, root_controller)
-                )
+                controller = root_controller if name == "root" else controllers.get(name)
+                if controller is None and name != "root":
+                    # A stored group with no live group (it was pruned, or the tree differs):
+                    # loading it into the root controller would corrupt the root's temperature.
+                    restored.append(f"kappa:{name}:dropped")
+                    log.warning("W021: stored temperature of group %r has no live group; dropped", name)
+                    continue
                 if controller is not None and hasattr(controller, "load_state_dict"):
                     controller.load_state_dict(state)
                     restored.append(f"kappa:{name}")
@@ -1129,6 +1204,12 @@ class MACTFCheckpoint:
                 if callable(loader):
                     loader(stored.watchdog)
                     restored.append("watchdog")
+
+            # 11b. what the trainer keeps outside the checkpoint's own sections: strategy,
+            # freeze set, callbacks, policy and function state (document 17).
+            finish = getattr(type(trainer), "_finish_restore", None)
+            if callable(finish):
+                finish(trainer, stored)
 
             # 12. position.
             try:
@@ -1184,6 +1265,11 @@ class MACTFCheckpoint:
             bit_identical_expected=bit_identical,
             duration=time.monotonic() - started,
             notes=tuple(notes),
+            component_notes=(
+                tuple(getattr(trainer, "component_notes", ()) or ())
+                if callable(prepare)
+                else ()
+            ),
         )
         signals.checkpoint_written.send(
             sender=self, record=None, payload=stored.as_dict(), restored=True
@@ -1354,6 +1440,7 @@ class MACTFCheckpoint:
             bit_identical_expected=report.bit_identical_expected,
             duration=report.duration,
             notes=report.notes,
+            component_notes=report.component_notes,
         )
 
     # -- retention -------------------------------------------------------
@@ -1550,14 +1637,23 @@ def _warning_count(warnings: Any) -> int:
     return total
 
 
+#: Statuses a strategy or a failed epoch sets and clears on its own. They are derived again in
+#: the next epoch, so a resume compares them as ``active``. ``pruned`` is structural.
+_TRANSIENT_STATUSES = frozenset({"frozen", "failed"})
+
+
 def _topology(state: Mapping[str, Any]) -> tuple:
+    def structural(status: Any) -> str:
+        text = str(status or "")
+        return "active" if text in _TRANSIENT_STATUSES else text
+
     return tuple(
         sorted(
             (
                 str(node.get("path")),
                 str(node.get("parent")),
                 str(node.get("role", "")),
-                str(node.get("status", "")),
+                structural(node.get("status", "")),
             )
             for node in state.get("nodes", [])
         )
@@ -1575,5 +1671,5 @@ def _topology_diff(current: Mapping[str, Any], incoming: Mapping[str, Any]) -> s
     if extra:
         parts.append("trainer-only nodes " + ", ".join(repr(item) for item in extra[:5]))
     if not parts:
-        parts.append("the same paths have different parents, roles, or statuses")
+        parts.append("the same paths have different parents, roles, or structural statuses")
     return "; ".join(parts)

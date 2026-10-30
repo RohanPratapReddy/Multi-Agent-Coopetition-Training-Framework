@@ -17,11 +17,27 @@ _EXPORTS: dict[str, str] = {
     "Orchestrator": "orchestrator", "RunConfig": "orchestrator",
     "PhaseContext": "phases", "aggregate": "phases", "bootstrap": "phases", "debate": "phases",
     "local_update": "phases", "score_episode": "phases", "stress_test": "phases",
+    # Document 17 section 13: which class runs the epochs.
+    "Engine": "dispatch", "ENGINES": "dispatch", "ENGINE_ORCHESTRATOR": "dispatch",
+    "ENGINE_TRAINER": "dispatch", "engine_factory": "dispatch", "engine_for": "dispatch",
+    "engine_name": "dispatch", "engine_of": "dispatch",
+    "TrainerEngine": "engine",
 }
 
 if TYPE_CHECKING:  # pragma: no cover - static analysers see the real imports
     from .checkpoint import CheckpointManager, CheckpointRecord, should_rollback
     from .episode import Episode, EpisodeRunner, PeerEpisode, Task, TaskSource, consensus, random_task
+    from .dispatch import (
+        ENGINES,
+        ENGINE_ORCHESTRATOR,
+        ENGINE_TRAINER,
+        Engine,
+        engine_factory,
+        engine_for,
+        engine_name,
+        engine_of,
+    )
+    from .engine import TrainerEngine
     from .orchestrator import Orchestrator, RunConfig
     from .phases import PhaseContext, aggregate, bootstrap, debate, local_update, score_episode, stress_test
 

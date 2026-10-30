@@ -125,6 +125,8 @@ class TrainResult:
     #: The episode scorecards the trainer produced, oldest first. Not part of ``as_dict``:
     #: scorecards have their own wire form and can be large.
     episodes: tuple[Any, ...] = ()
+    #: Notes from the component verification of a resume (document 17 section 14.5).
+    component_notes: tuple[str, ...] = ()
 
     @property
     def halted(self) -> bool:
@@ -139,6 +141,7 @@ class TrainResult:
             "status": self.status,
             "reason": self.reason,
             "metrics": dict(self.metrics),
+            **({"component_notes": list(self.component_notes)} if self.component_notes else {}),
         }
 
 

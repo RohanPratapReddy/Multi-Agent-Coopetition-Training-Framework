@@ -47,3 +47,9 @@ ORCHESTRATOR:
   RESUME_FROM: null
   ANNOUNCE: true
   PAUSE_IS_FATAL: false
+  # Which class runs the epochs: orchestrator | trainer (document 17 section 13).
+  ENGINE: orchestrator
+  # Reproduce the orchestrator's cumulative signal window under the trainer engine.
+  ENGINE_COMPAT: true
+  # Allow --resume to continue a checkpoint written by the other engine (E091).
+  ALLOW_ENGINE_SWITCH: false

@@ -73,6 +73,37 @@ class Aggregator:
         self.fallback_to_reference = bool(fallback_to_reference)
         self.aggregate_buffers = aggregate_buffers
 
+    # -- cloning (document 17 section 10.7) --------------------------------
+    def options(self) -> dict[str, Any]:
+        """The constructor keywords other than ``controller``.
+
+        A subclass with extra constructor state overrides this, returning
+        ``{**super().options(), "my_arg": self.my_arg}``. ``clone_with`` and ``pristine``
+        rely on it, and ``verify_aggregator`` checks it round-trips.
+        """
+        return {
+            "weight_floor": self.weight_floor,
+            "weight_cap": self.weight_cap,
+            "confidence_floor": self.confidence_floor,
+            "trim_fraction": self.trim_fraction,
+            "disagreement_max": self.disagreement_max,
+            "fallback_to_reference": self.fallback_to_reference,
+            "aggregate_buffers": self.aggregate_buffers,
+        }
+
+    def clone_with(self, controller: AdaptiveKappa) -> "Aggregator":
+        """A sibling for another aggregation group: same class, same bounds, own controller."""
+        return type(self)(controller=controller, **self.options())
+
+    def pristine(self) -> "Aggregator":
+        """The framework's own ``Aggregator`` with this one's bounds and controller.
+
+        What the guard falls back to when a custom ``compute_weights`` is the thing that
+        failed: the fallback must not run the code that just misbehaved. Only the base class's
+        options are passed (a subclass's extra ones mean nothing to ``Aggregator``).
+        """
+        return Aggregator(controller=self.controller, **Aggregator.options(self))
+
     # -- weight construction ---------------------------------------------
     def compute_weights(
         self,
@@ -412,3 +443,76 @@ def _project_bounded(
             for name in adjustable:
                 projected[name] = min(cap, max(floor, projected[name] + share))
     return projected
+
+
+def build_aggregator(
+    spec: Any,
+    coopetition: dict[str, Any],
+    *,
+    num_peers: int,
+    resolver: Any | None = None,
+    trusted: bool = True,
+    record: dict[str, Any] | None = None,
+) -> Aggregator:
+    """``TRAINER.AGGREGATOR`` to an ``Aggregator``.
+
+    ``record``, when given, receives the resolved component under ``"resolved"`` so the
+    trainer can put it in the checkpoint's component manifest (document 17 section 14).
+
+    ``None`` is the built-in, built exactly as ``Aggregator.from_settings`` does. A name or
+    mapping goes through the ``aggregator`` registry with the controller and every bound
+    (``weight_floor``, ``weight_cap``, ...) *injected*, so a spec carries only the class's own
+    extra parameters and can never loosen a bound (invariant A3).
+    """
+    from ..components.resolver import ComponentResolver, ComponentSpec
+
+    if isinstance(spec, Aggregator):
+        return spec
+    if spec is None:
+        return Aggregator.from_settings(dict(coopetition), num_peers=num_peers)
+    controller = AdaptiveKappa.from_settings(dict(coopetition), num_peers=num_peers)
+    injected = {
+        "controller": controller,
+        "weight_floor": float(coopetition.get("WEIGHT_FLOOR", 0.02)),
+        "weight_cap": float(coopetition.get("WEIGHT_CAP", 0.60)),
+        "confidence_floor": float(coopetition.get("CONFIDENCE_FLOOR", 0.10)),
+        "trim_fraction": float(coopetition.get("TRIM_FRACTION", 0.0)),
+        "disagreement_max": float(coopetition.get("DISAGREEMENT_MAX", 0.75)),
+        "fallback_to_reference": bool(coopetition.get("FALLBACK_TO_REFERENCE", True)),
+        "aggregate_buffers": str(coopetition.get("AGGREGATE_BUFFERS", "top")),
+    }
+    parsed = ComponentSpec.parse("aggregator", spec)
+    resolved = (resolver or ComponentResolver()).resolve(parsed, trusted=trusted, inject=injected)
+    built = resolved.instance
+    verify_aggregator(built)
+    if record is not None:
+        record["resolved"] = resolved
+    return built
+
+
+def verify_aggregator(aggregator: Aggregator) -> None:
+    """``E065`` unless ``clone_with`` returns the same class with the same options."""
+    from ..exceptions import ImproperlyConfigured
+
+    probe = AdaptiveKappa(num_peers=2)
+    try:
+        sibling = aggregator.clone_with(probe)
+    except Exception as error:  # noqa: BLE001 - reported with the cure
+        raise ImproperlyConfigured(
+            f"E065: {type(aggregator).__name__}.clone_with() failed ({error}); a subclass with "
+            "extra constructor arguments must override options() to return them"
+        ) from error
+    if type(sibling) is not type(aggregator) or sibling.options() != aggregator.options():
+        raise ImproperlyConfigured(
+            f"E065: {type(aggregator).__name__}.clone_with() does not reproduce the class and "
+            f"options (got {type(sibling).__name__} / {sibling.options()!r}); override options()"
+        )
+    if sibling.controller is not probe:
+        raise ImproperlyConfigured(
+            f"E065: {type(aggregator).__name__}.clone_with() must use the controller it is given"
+        )
+
+
+from ..components.registry import HUB  # noqa: E402
+
+HUB.registry("aggregator").register_builtin("default", Aggregator)

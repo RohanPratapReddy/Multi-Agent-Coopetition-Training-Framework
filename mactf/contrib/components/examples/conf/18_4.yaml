@@ -1,0 +1,8 @@
+# 18.4: a peer strategy that mixes only every N epochs.
+COMPONENTS: {MODULES: ["mactf.contrib.components.examples.every_n"]}
+ORCHESTRATOR: {ENGINE: trainer}
+TRAINER:
+  PEER_STRATEGY: {type: every_n, params: {period: 2}}
+  PEER_STRATEGY_OVERRIDES:
+    "peer-2": independent                  # one group never mixes, whatever the default says
+  STRATEGY_GUARD: {MODE: skip, CHECK_FROZEN: true}

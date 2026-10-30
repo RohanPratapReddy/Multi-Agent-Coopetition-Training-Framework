@@ -9,11 +9,13 @@ in ``extras``.
 
 from __future__ import annotations
 
+import math
 from typing import Any, Callable, ClassVar, Mapping, Protocol, Sequence, runtime_checkable
 
 import torch
 import torch.nn.functional as F
 
+from ...components.legacy import LegacyTable
 from ...exceptions import ContractError, ValidationError
 from ..loss import LossBreakdown, LossConfig, policy_loss
 from ..policy import PolicyOutput, reverse_kl
@@ -508,6 +510,91 @@ class ChainedLoss(_LossBase):
         return build_from_kwargs(cls, {**payload, "terms": terms})
 
 
+class WeightedSumLoss(_LossBase):
+    """``sum_i weight_i * term_i``, each term a registered loss.
+
+    ``ChainedLoss`` adds terms with weight 1; a term that needs a coefficient has to scale
+    itself. This takes the coefficients out of the terms so the same ``kl`` term can be
+    used at 0.01 in one run and 0.1 in another by changing a spec, not a class.
+    """
+
+    spec_type = "weighted_sum"
+
+    def __init__(
+        self,
+        terms: Sequence[Any] | None = None,
+        *,
+        weights: Sequence[float] | None = None,
+    ) -> None:
+        raw = list(terms or [])
+        if not raw:
+            raise ValidationError("WeightedSumLoss needs at least one term")
+        resolved = list(weights) if weights is not None else [1.0] * len(raw)
+        if len(resolved) != len(raw):
+            raise ValidationError(
+                f"WeightedSumLoss has {len(raw)} terms but {len(resolved)} weights"
+            )
+        for index, weight in enumerate(resolved):
+            if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+                raise ValidationError(f"WeightedSumLoss weight {index} is not a number: {weight!r}")
+            if not math.isfinite(float(weight)):
+                raise ValidationError(f"WeightedSumLoss weight {index} is not finite: {weight!r}")
+        built = []
+        for term in raw:
+            if isinstance(term, Mapping):
+                from .registry import build_function
+
+                term = build_function(term, family="loss")
+            if not callable(getattr(term, "compute", None)):
+                raise ValidationError(f"WeightedSumLoss term {type(term).__name__} has no compute()")
+            built.append(term)
+        self.terms: list[Any] = built
+        self.weights: list[float] = [float(weight) for weight in resolved]
+        self.required_fields = frozenset(
+            key for term in built for key in getattr(term, "required_fields", ())
+        )
+
+    def _compute(self, batch):
+        breakdown = LossBreakdown()
+        total = None
+        for term, weight in zip(self.terms, self.weights):
+            component, part = term.compute(batch)
+            scaled = component * weight
+            total = scaled if total is None else total + scaled
+            breakdown.policy += weight * part.policy
+            breakdown.value += weight * part.value
+            breakdown.kl += weight * part.kl
+            breakdown.entropy += weight * part.entropy
+            breakdown.compliance += weight * part.compliance
+            label = getattr(term, "spec_type", type(term).__name__)
+            breakdown.extras[f"term:{label}"] = float(weight * part.total)
+            for key, value in part.extras.items():
+                breakdown.extras[f"{label}.{key}"] = value
+                if key == "advantage_mean":
+                    # The one number a reader (the StepGuard's void probe) looks for unprefixed.
+                    breakdown.extras.setdefault("advantage_mean", value)
+        assert total is not None  # the constructor rejects an empty term list
+        breakdown.total = float(total.detach().item())
+        return total, breakdown
+
+    def describe(self):
+        return {
+            **super().describe(),
+            "weights": list(self.weights),
+            "terms": [term.describe() for term in self.terms],
+        }
+
+    @classmethod
+    def from_spec(cls, spec: Mapping[str, Any]) -> "WeightedSumLoss":
+        payload = dict(spec or {})
+        kind = payload.pop("type", None)
+        if kind is not None and kind != cls.spec_type:
+            raise ValidationError(
+                f"WeightedSumLoss.from_spec cannot build type {kind!r}; it builds 'weighted_sum'"
+            )
+        return build_from_kwargs(cls, payload)
+
+
 def _reference_tensor(batch: Mapping[str, Any]) -> torch.Tensor:
     """Find a tensor to take device/dtype from, for scalar terms."""
     for key in ("policy", "values", "advantages", "rewards", "void_mask"):
@@ -522,18 +609,22 @@ def _reference_tensor(batch: Mapping[str, Any]) -> torch.Tensor:
     return torch.zeros(())
 
 
-LOSS_FUNCTION_TYPES: dict[str, type] = {
-    "policy_gradient": PolicyGradientLoss,
-    "value_regression": ValueRegressionLoss,
-    "kl": KLLoss,
-    "entropy": EntropyBonus,
-    "compliance_floor": ComplianceFloorLoss,
-    "void_mask": VoidMaskLoss,
-    "composite": CompositeLoss,
-    "causal_lm": CausalLMLoss,
-    "callable": CallableLoss,
-    "chained": ChainedLoss,
-}
+LOSS_FUNCTION_TYPES: dict[str, type] = LegacyTable(
+    "rl_function.loss",
+    {
+        "policy_gradient": PolicyGradientLoss,
+        "value_regression": ValueRegressionLoss,
+        "kl": KLLoss,
+        "entropy": EntropyBonus,
+        "compliance_floor": ComplianceFloorLoss,
+        "void_mask": VoidMaskLoss,
+        "composite": CompositeLoss,
+        "causal_lm": CausalLMLoss,
+        "callable": CallableLoss,
+        "chained": ChainedLoss,
+        "weighted_sum": WeightedSumLoss,
+    },
+)
 
 LOSS_CLASSES = tuple(LOSS_FUNCTION_TYPES.values())
 
@@ -552,4 +643,5 @@ __all__ = [
     "PolicyGradientLoss",
     "ValueRegressionLoss",
     "VoidMaskLoss",
+    "WeightedSumLoss",
 ]

@@ -14,6 +14,7 @@ from typing import Any, Callable, ClassVar, Iterable, Mapping, Protocol, runtime
 import torch
 import torch.nn as nn
 
+from ...components.legacy import LegacyTable
 from ...coopetition.adapter import PeerAdapter
 from ...exceptions import ContractError, ValidationError
 from ..value import ValueEstimate, ValueHead
@@ -488,15 +489,18 @@ class CallableValueFunction(_ValueBase):
         return payload
 
 
-VALUE_FUNCTION_TYPES: dict[str, type] = {
-    "module": ModuleValueFunction,
-    "critic": CriticValueFunction,
-    "reference": ReferenceValueFunction,
-    "zero": ZeroValueFunction,
-    "image": ImageValueFunction,
-    "nested": NestedValueFunction,
-    "callable": CallableValueFunction,
-}
+VALUE_FUNCTION_TYPES: dict[str, type] = LegacyTable(
+    "rl_function.value",
+    {
+        "module": ModuleValueFunction,
+        "critic": CriticValueFunction,
+        "reference": ReferenceValueFunction,
+        "zero": ZeroValueFunction,
+        "image": ImageValueFunction,
+        "nested": NestedValueFunction,
+        "callable": CallableValueFunction,
+    },
+)
 
 #: The classes the registry imports. Kept as a tuple so ``registry`` does not need
 #: to know the mapping above.

@@ -18,6 +18,7 @@ from typing import Any
 _EXPORTS: dict[str, str] = {
     # config (torch-free)
     "CONFORMANCE_KEYS": "config",
+    "CoDistillPolicy": "policy",
     "CONFORMANCE_MODES": "config",
     "DISTILLATION_DEFAULTS": "config",
     "DISTILLATION_KEYS": "config",

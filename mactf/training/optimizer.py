@@ -22,6 +22,7 @@ from __future__ import annotations
 import copy
 import functools
 import inspect
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence, runtime_checkable
@@ -31,12 +32,17 @@ import torch.nn as nn
 
 from ..exceptions import ContractError, ImproperlyConfigured, ValidationError
 
+log = logging.getLogger("mactf.training.optimizer")
+
 __all__ = [
+    "BackendBase",
     "CallableOptimizer",
     "MACTFOptimizer",
+    "NullOptimizer",
     "OptimizerBackend",
     "ParamGroupRouter",
     "Route",
+    "RouterOptimizer",
     "SCIPY_METHODS",
     "ScipyOptimizer",
     "StepOutcome",
@@ -136,14 +142,21 @@ def _trainable(parameters: Iterable[nn.Parameter]) -> list[nn.Parameter]:
     return selected
 
 
-class _Backend:
-    """Shared plumbing: binding, learning-rate access, and honest ``describe``."""
+class BackendBase:
+    """Shared plumbing: binding, learning-rate access, and honest ``describe``.
+
+    Called ``_Backend`` before document 17; the old name stays as an alias at the end of
+    this class's definition, so ``isinstance(x, _Backend)`` keeps working.
+    """
 
     name: str = "backend"
 
     #: ``CallableOptimizer`` may legitimately operate on a frozen model, so an
     #: empty parameter list is not an error everywhere.
     requires_parameters: bool = True
+    #: True for a backend whose state lives in objects bound to parameters (torch, router)
+    #: and that therefore must be rebuilt and reloaded after ``Peer.to`` moves them.
+    rebinds_on_move: bool = False
 
     def __init__(self) -> None:
         self._parameters: list[nn.Parameter] = []
@@ -160,7 +173,7 @@ class _Backend:
     def parameters(self) -> tuple[nn.Parameter, ...]:
         return tuple(self._parameters)
 
-    def bind(self, parameters: Iterable[nn.Parameter]) -> "_Backend":
+    def bind(self, parameters: Iterable[nn.Parameter]) -> "BackendBase":
         self._parameters = _trainable(parameters)
         if not self._parameters and self.requires_parameters:
             raise ContractError(
@@ -169,7 +182,7 @@ class _Backend:
         self._bound = True
         return self
 
-    def name_parameters(self, module: nn.Module, *, prefix: str = "") -> "_Backend":
+    def name_parameters(self, module: nn.Module, *, prefix: str = "") -> "BackendBase":
         """Record fully qualified names, which :class:`ParamGroupRouter` matches on."""
         self._names = {
             id(parameter): f"{prefix}{name}" for name, parameter in module.named_parameters()
@@ -221,8 +234,23 @@ class _Backend:
             "stateful": True,
         }
 
+    def reset_state(self) -> None:
+        """Drop state computed against weights that no longer exist (momentum, history).
 
-class TorchOptimizer(_Backend):
+        Called after an aggregation write-back when ``COOPETITION.RESET_OPTIMIZERS`` is
+        true. Parameters and hyper-parameters are not touched.
+        """
+        return None
+
+    def rebind(self) -> "BackendBase":
+        """Bind again to the parameters already held, keeping any name table."""
+        return self.bind(self._parameters)
+
+
+_Backend = BackendBase  # the pre-17 name; kept so ``isinstance(x, _Backend)`` still works
+
+
+class TorchOptimizer(BackendBase):
     """A thin adapter over a torch optimizer.
 
     Three accepted forms, each real::
@@ -368,6 +396,12 @@ class TorchOptimizer(_Backend):
         self._instance.load_state_dict(copy.deepcopy(dict(state)))
         self._learning_rate = float(self._instance.param_groups[0].get("lr", self._learning_rate))
 
+    rebinds_on_move = True
+
+    def reset_state(self) -> None:
+        if self._instance is not None:
+            self._instance.state.clear()
+
     def describe(self) -> dict[str, Any]:
         payload = super().describe()
         payload.update(
@@ -393,7 +427,7 @@ def _require_scipy():
     return optimize
 
 
-class ScipyOptimizer(_Backend):
+class ScipyOptimizer(BackendBase):
     """A full-batch scipy optimizer driven by a closure.
 
     Honest limitation, stated in ``describe()``: scipy methods are full-batch and
@@ -569,7 +603,7 @@ class ScipyOptimizer(_Backend):
         return payload
 
 
-class CallableOptimizer(_Backend):
+class CallableOptimizer(BackendBase):
     """A user function as the update rule.
 
     ``CallableOptimizer(fn)`` calls ``fn(parameters)`` imperatively.
@@ -669,7 +703,7 @@ class Route:
         }
 
 
-class ParamGroupRouter(_Backend):
+class ParamGroupRouter(BackendBase):
     """Routes each trainable parameter to the first matching route, then default.
 
     ``pattern`` is matched with ``re.fullmatch`` against the fully qualified
@@ -704,12 +738,12 @@ class ParamGroupRouter(_Backend):
                 "default silently drops any parameter no route claims"
             )
         self.default: Any = default
-        self._backends: dict[int, _Backend] = {}
+        self._backends: dict[int, BackendBase] = {}
         self._assignment: dict[str, str] = {}
 
     @staticmethod
-    def _as_backend(candidate: Any) -> _Backend:
-        if isinstance(candidate, _Backend):
+    def _as_backend(candidate: Any) -> BackendBase:
+        if isinstance(candidate, BackendBase):
             return candidate
         if (
             isinstance(candidate, torch.optim.Optimizer)
@@ -765,16 +799,31 @@ class ParamGroupRouter(_Backend):
     #: names. ``bind`` falls back to empty names, which routes to the default.
     _named_source: list[tuple[str, nn.Parameter]] = []
 
+    rebinds_on_move = True
+    #: The pairs ``bind_named`` last saw, kept so ``rebind`` (after a device move) matches
+    #: routes on the same names instead of dropping every parameter to the default route.
+    _named_pairs: list[tuple[str, nn.Parameter]] = []
+
     def bind_named(
         self, named_parameters: Iterable[tuple[str, nn.Parameter]]
     ) -> "ParamGroupRouter":
         """Bind using fully qualified names, which is what routes match on."""
         pairs = [(str(name), parameter) for name, parameter in named_parameters]
         self._named_source = pairs
+        self._named_pairs = list(pairs)
         try:
             return self.bind([parameter for _, parameter in pairs])
         finally:
             self._named_source = []
+
+    def rebind(self) -> "ParamGroupRouter":
+        if self._named_pairs:
+            return self.bind_named(self._named_pairs)
+        return self.bind(self._parameters)
+
+    def reset_state(self) -> None:
+        for backend in self._backends.values():
+            backend.reset_state()
 
     @property
     def assignment(self) -> dict[str, str]:
@@ -901,6 +950,22 @@ class MACTFOptimizer:
         #: ``(name, kwargs)`` of a ``torch.optim.lr_scheduler`` class to build once
         #: ``bind`` has produced the torch optimizer it wraps. Set by ``from_block``.
         self._pending_scheduler: tuple[str, dict[str, Any]] | None = None
+        #: Hash of the plan entry that built this optimizer. Empty when the facade was built
+        #: the legacy way (an in-code spec, the default block, the inline Adam): such a
+        #: facade writes the same checkpoint keys as before (invariant O1).
+        self.spec_hash: str = ""
+        self.slot: str = ""
+        #: Hash of the plan entry this facade was built from, customized or not. Never
+        #: checkpointed; the trainer compares it to know a restored plan selects another entry.
+        self.entry_hash: str = ""
+        self.scheduler_name: str | None = None
+        #: ``COMPONENTS.STRICT_RESTORE``: a spec-hash mismatch on restore raises E055.
+        self.strict_restore: bool = False
+
+    def plan_scheduler(self, scheduler: tuple[str, dict[str, Any]] | None) -> None:
+        """Name the scheduler ``bind`` will build; ``from_block`` does this with its own tuple."""
+        self._pending_scheduler = scheduler
+        self.scheduler_name = scheduler[0] if scheduler else None
 
     # -- binding ---------------------------------------------------------
     def bind(
@@ -927,23 +992,22 @@ class MACTFOptimizer:
         return self
 
     def attach_scheduler(self, name: str, **kwargs: Any) -> Any:
-        """Build ``torch.optim.lr_scheduler.<name>`` over the bound torch optimizer.
+        """Build the scheduler ``name`` over the bound torch optimizer.
 
-        A scheduler is named, not constructed from YAML, because its parameters
-        differ per class and a mapping cannot be validated without importing torch.
+        ``name`` is a registered scheduler (a built-in such as ``warmup_cosine``, or a plugin's)
+        or, as before, any class of ``torch.optim.lr_scheduler``. A scheduler is named, not
+        constructed from YAML, because its parameters differ per class.
         """
+        from .schedulers import build_scheduler
+
         instance = getattr(self.backend, "_instance", None)
         if instance is None:
             raise ValidationError(
-                f"scheduler {name!r} needs a bound torch optimizer; the "
+                f"E052: scheduler {name!r} needs a bound torch optimizer; the "
                 f"{type(self.backend).__name__} backend has none"
             )
-        factory = getattr(torch.optim.lr_scheduler, str(name), None)
-        if factory is None or not isinstance(factory, type):
-            raise ValidationError(
-                f"unknown scheduler {name!r}; torch.optim.lr_scheduler has no such class"
-            )
-        self.scheduler = factory(instance, **kwargs)
+        self.scheduler = build_scheduler(name, instance, kwargs)
+        self.scheduler_name = str(name)
         self._pending_scheduler = None
         return self.scheduler
 
@@ -1066,11 +1130,15 @@ class MACTFOptimizer:
         choice; this is the substitute that keeps an SGD(momentum=0.9) an SGD.
         """
         del runtime
-        state = self.backend.state_dict()
-        if isinstance(self.backend, (TorchOptimizer, ParamGroupRouter)):
-            self.backend.bind(self.backend.parameters)
+        if getattr(self.backend, "rebinds_on_move", False):
+            state = self.backend.state_dict()
+            self.backend.rebind()
             self.backend.load_state_dict(_cpu_state(state))
         return self
+
+    def reset_state(self) -> None:
+        """What ``trainer._clear_optimizer_state`` did, for every backend, not only torch."""
+        self.backend.reset_state()
 
     # -- persistence -----------------------------------------------------
     def state_dict(self) -> dict[str, Any]:
@@ -1088,6 +1156,11 @@ class MACTFOptimizer:
         }
         if self.router is not None:
             payload["router"] = self.router.describe()
+        if self.spec_hash:
+            payload["spec_hash"] = self.spec_hash
+            payload["slot"] = self.slot
+            if self.scheduler_name:
+                payload["scheduler_name"] = self.scheduler_name
         return payload
 
     def load_state_dict(self, payload: Mapping[str, Any]) -> None:
@@ -1097,17 +1170,67 @@ class MACTFOptimizer:
                 "MACTFOptimizer.load_state_dict requires a bound optimizer; call "
                 "bind(parameters) first"
             )
+        state = self._reconcile(state)
         if state.get("state"):
             self.backend.load_state_dict(_cpu_state(state["state"]))
-        if "lr" in state:
+        hyper = state.get("_hyper")
+        if hyper:
+            from .optimizer_migrations import apply_hyper_parameters
+
+            apply_hyper_parameters(self.backend, hyper)
+        if "lr" in state and float(state.get("lr") or 0.0) > 0.0:
+            # A 0.0 rate is a backend with no rate (callable, scipy, null): nothing to restore.
             self.set_lr(float(state["lr"]))
-        if self.scheduler is not None and state.get("scheduler"):
+        if self.scheduler is not None and state.get("scheduler") and not hyper:
             self.scheduler.load_state_dict(state["scheduler"])
+        elif self.scheduler is not None and hyper and state.get("scheduler_position") is not None:
+            from .schedulers import fast_forward
+
+            fast_forward(self.scheduler, int(state["scheduler_position"]))
         if self.scaler is not None and state.get("scaler"):
             self.scaler.load_state_dict(state["scaler"])
         self.grad_accumulation = int(state.get("grad_accumulation", self.grad_accumulation))
         self.max_grad_norm = state.get("max_grad_norm", self.max_grad_norm)
         self.node_path = str(state.get("node_path", self.node_path))
+
+
+    def _reconcile(self, state: dict[str, Any]) -> dict[str, Any]:
+        """Return the state to load, after comparing the saved spec hash with this one."""
+        saved = str(state.get("spec_hash") or "")
+        if not saved or not self.spec_hash or saved == self.spec_hash:
+            return state
+        from ..orchestration.checkpoint_v2 import ContractMismatch
+        from .optimizer_migrations import compatible_state, hyper_parameters
+
+        if self.strict_restore:
+            raise ContractMismatch(
+                f"E055: optimizer state for {self.node_path!r} was written under spec "
+                f"{saved} ({state.get('class')}), this run uses {self.spec_hash} "
+                f"({self.describe().get('class')}); COMPONENTS.STRICT_RESTORE is on"
+            )
+        reason = compatible_state(state.get("state"), self.backend, state.get("class"))
+        if reason is not None:
+            log.warning(
+                "W015 optimizer state for %r dropped: %s (saved spec %s, current %s)",
+                self.node_path, reason, saved, self.spec_hash,
+            )
+            return {
+                key: value for key, value in state.items()
+                if key not in ("state", "lr", "scheduler", "param_groups")
+            }
+        log.warning(
+            "W015 optimizer state for %r carried across a spec change (saved %s, current %s); "
+            "hyper-parameters stay those of the current spec",
+            self.node_path, saved, self.spec_hash,
+        )
+        carried = dict(state)
+        carried["lr"] = self.backend.learning_rate
+        carried["_hyper"] = hyper_parameters(self.backend)
+        saved_scheduler = state.get("scheduler")
+        if isinstance(saved_scheduler, dict):
+            # A LambdaLR-style state counts ``step()`` calls in ``last_epoch``: that is the position.
+            carried["scheduler_position"] = int(saved_scheduler.get("last_epoch", 0) or 0)
+        return carried
 
     def describe(self) -> dict[str, Any]:
         payload = dict(self.backend.describe())
@@ -1122,6 +1245,11 @@ class MACTFOptimizer:
                 "router": self.router.describe() if self.router is not None else None,
             }
         )
+        if self.spec_hash:
+            payload["spec_hash"] = self.spec_hash
+            payload["slot"] = self.slot
+            if self.scheduler_name:
+                payload["scheduler_name"] = self.scheduler_name
         return payload
 
     # -- construction ----------------------------------------------------
@@ -1136,6 +1264,7 @@ class MACTFOptimizer:
 
         # An unset field (``None``) means "the backend's own default", never the literal None.
         payload = {key: value for key, value in dict(spec).items() if value is not None}
+        raw_kind = str(payload.get("type", payload.get("backend", "torch")))
         kind = str(payload.pop("type", payload.pop("backend", "torch"))).lower()
         lr = payload.pop("lr", payload.pop("learning_rate", None))
         weight_decay = float(payload.pop("weight_decay", 0.0))
@@ -1158,9 +1287,8 @@ class MACTFOptimizer:
                 payload.pop(stale, None)
             factory = getattr(torch.optim, name, None)
             if factory is None:
-                raise ValidationError(
-                    f"unknown torch optimizer {name!r}; torch.optim has no such class"
-                )
+                # Not a torch class: a registered optimizer (``type: torch, class: Lion``).
+                return cls._from_registry(name, payload, common, torch_kind=True)
             return cls(
                 TorchOptimizer(factory, lr=lr, weight_decay=weight_decay, **payload),
                 **common,
@@ -1173,9 +1301,50 @@ class MACTFOptimizer:
             if fn is None:
                 raise ValidationError("a callable optimizer spec requires 'fn'")
             return cls(CallableOptimizer(fn, **payload), **common)
-        raise ValidationError(
-            f"unknown optimizer backend {kind!r}; accepted: torch, scipy, callable"
+        return cls._from_registry(raw_kind, payload, common)
+
+    @classmethod
+    def _from_registry(
+        cls, name: str, params: dict[str, Any], common: dict[str, Any], *, torch_kind: bool = False
+    ) -> "MACTFOptimizer":
+        """Build a registered backend (``type: Lion``, ``type: null``, ``type: router``).
+
+        ``lr`` and ``weight_decay`` are facade-common keys: they are forwarded when the
+        backend accepts them and dropped otherwise, which is what the legacy scipy and
+        callable branches already do with the shipped ``LR`` and ``WEIGHT_DECAY`` defaults.
+        """
+        from ..components.contracts import BIND_KEYS, UNBOUND
+        from ..components.registry import HUB
+
+        registry = HUB.registry("optimizer")
+        component = registry.find(name) or registry.find(name.lower())
+        if component is None:
+            if torch_kind:
+                raise ValidationError(
+                    f"unknown torch optimizer {name!r}; torch.optim has no such class and no "
+                    f"optimizer of that name is registered (registered: {', '.join(registry.names())})"
+                )
+            raise ValidationError(
+                f"unknown optimizer backend {name!r}; accepted: torch, scipy, callable, "
+                + ", ".join(registry.names())
+            )
+        accepted = component.accepted_params()
+        torch_class = isinstance(component.factory, type) and issubclass(
+            component.factory, torch.optim.Optimizer
         )
+        values = dict(params)
+        for key, wanted in (("lr", common["lr"]), ("weight_decay", common["weight_decay"])):
+            if wanted is None or key in values:
+                continue
+            if key in accepted or (torch_class and key == "lr"):
+                values[key] = wanted
+        # ``learning_rate`` is the backend spelling used by ScipyOptimizer and CallableOptimizer.
+        if common["lr"] is not None and "learning_rate" in accepted and "learning_rate" not in values:
+            values["learning_rate"] = common["lr"]
+        backend = registry.build(
+            component.name, values, inject={key: UNBOUND for key in BIND_KEYS}
+        )
+        return cls(backend, **common)
 
     @classmethod
     def from_block(cls, block: Mapping[str, Any], *, node_path: str = "") -> "MACTFOptimizer":
@@ -1228,8 +1397,15 @@ def optimizer_spec(block: Mapping[str, Any]) -> dict[str, Any]:
     }
     payload.pop("scheduler", None)
     payload.pop("scheduler_kwargs", None)
-    kind = str(payload.pop("type", payload.pop("backend", "torch"))).lower()
-    payload["type"] = kind
+    for plan_key in ("overrides", "migrate", "verify", "strict_globs", "params"):
+        payload.pop(plan_key, None)
+    written = str(payload.pop("type", payload.pop("backend", "torch")))
+    kind = written.lower()
+    if kind == "none":
+        kind = "null"
+    # A built-in kind is normalised; a registered name keeps the spelling the project wrote,
+    # because registry names are case-sensitive ("Lion" is not "lion").
+    payload["type"] = kind if kind in {"torch", "scipy", "callable", "null"} else written
 
     beta0, beta1 = payload.pop("beta0", None), payload.pop("beta1", None)
     betas = payload.pop("betas", None)
@@ -1237,9 +1413,14 @@ def optimizer_spec(block: Mapping[str, Any]) -> dict[str, Any]:
         betas = [beta0, beta1]
 
     if kind != "torch":
-        # Adam's knobs mean nothing to a scipy or callable backend, which would
-        # receive them as unexpected keywords.
-        for key in ("class", "class_name", "name", "eps"):
+        # Adam's knobs mean nothing to a scipy, callable or null backend, which would
+        # receive them as unexpected keywords. A registered backend keeps ``eps``.
+        drop = (
+            ("class", "class_name", "name", "eps")
+            if kind in {"scipy", "callable", "null"}
+            else ("class", "class_name", "name")
+        )
+        for key in drop:
             payload.pop(key, None)
         return payload
 
@@ -1266,7 +1447,7 @@ def optimizer_spec(block: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _resolve_backend(candidate: Any, *, lr: float | None = None, weight_decay: float = 0.0) -> Any:
-    if isinstance(candidate, _Backend):
+    if isinstance(candidate, BackendBase):
         return candidate
     if isinstance(candidate, MACTFOptimizer):
         return candidate.backend
@@ -1312,7 +1493,7 @@ def describe_optimizer_spec(candidate: Any) -> str:
     """A short, stable name for a backend spec, for checkpoints and logs."""
     if candidate is None:
         return "none"
-    if isinstance(candidate, _Backend):
+    if isinstance(candidate, BackendBase):
         return candidate.describe().get("class", type(candidate).__name__)
     if isinstance(candidate, functools.partial):
         return getattr(candidate.func, "__name__", "partial")
@@ -1338,3 +1519,10 @@ def build_optimizer(
         named=list(module.named_parameters()),
     )
     return optimizer
+
+
+# The built-in registrations and the two data-described backends import names defined above,
+# so they come last (document 17 section 9.2.1).
+from .optimizer_builtins import NullOptimizer, RouterOptimizer, register_builtins  # noqa: E402
+
+register_builtins()

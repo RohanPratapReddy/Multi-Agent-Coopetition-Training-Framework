@@ -65,6 +65,12 @@ CONF_LAYOUT: tuple[ConfFile, ...] = (
         "Framework wiring: apps, middleware, and the HTTP transport limits.",
     ),
     ConfFile(
+        "components.yaml",
+        ("COMPONENTS", "COMPLIANCE"),
+        "Which components may be registered, replaced or imported, and the floor they "
+        "are held to.",
+    ),
+    ConfFile(
         "peers.yaml",
         ("PEERS",),
         "The swarm: one entry per peer, resolved from a class name.",
@@ -83,6 +89,11 @@ CONF_LAYOUT: tuple[ConfFile, ...] = (
         "loss.yaml",
         ("LOSS",),
         "The objective's coefficients and its backend.",
+    ),
+    ConfFile(
+        "rl.yaml",
+        ("RL",),
+        "Per-family RL function selection: advantage, loss, rollup, synthesis and the rest.",
     ),
     ConfFile(
         "scorer.yaml",

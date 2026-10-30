@@ -1,0 +1,136 @@
+{
+  "orchestrator": {
+    "epochs": [
+      {
+        "adjustments": [
+          "applied weight cap 0.6"
+        ],
+        "entropy": 0.6532634496688843,
+        "kappa": 1.0004937285261046,
+        "score": 0.5382652431726456,
+        "signal": {
+          "peer-1": 0.8265304863452911,
+          "peer-2": 0.25
+        },
+        "weights": {
+          "peer-1": 0.6,
+          "peer-2": 0.40000000000000013
+        }
+      },
+      {
+        "adjustments": [],
+        "entropy": 0.6828569173812866,
+        "kappa": 1.0015797800642654,
+        "score": 0.2621708810329437,
+        "signal": {
+          "peer-1": 0.5443506836891174,
+          "peer-2": 0.25608544051647186
+        },
+        "weights": {
+          "peer-1": 0.5716062188148499,
+          "peer-2": 0.4283937811851501
+        }
+      },
+      {
+        "adjustments": [],
+        "entropy": 0.6885374784469604,
+        "kappa": 1.0032273251186052,
+        "score": 0.5259134471416473,
+        "signal": {
+          "peer-1": 0.5382049381732941,
+          "peer-2": 0.34602810939153034
+        },
+        "weights": {
+          "peer-1": 0.5479720830917358,
+          "peer-2": 0.4520279169082641
+        }
+      }
+    ],
+    "rng_after": "4bcb3d354b6eafca1d6e9fbe99058f9ca7280e2921611ab3929fc6026192be12"
+  },
+  "trainer": {
+    "checkpoint_content_hash": "sha256:fff34a862669ef75ed33e916927fcb5e1f185510a63081d5193f9278d50c6736",
+    "checkpoint_episode": 2,
+    "checkpoint_identity_keys": [
+      "amp",
+      "command_line",
+      "created_at",
+      "device",
+      "dtype",
+      "engine",
+      "episode",
+      "global_step",
+      "hostname",
+      "mactf_version",
+      "mode",
+      "python_version",
+      "run_id",
+      "schema_version",
+      "score",
+      "torch_version"
+    ],
+    "checkpoint_sections": {
+      "adapters": "sha256:dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91",
+      "aggregations": "sha256:35c296378d858c19c900fe2a5b5788dc445ccb32a0ea12c10d46856bf7d34a7b",
+      "data": "sha256:6b7220075b8290ed54abb5c8c70249149f91248f3ab59b1b959576ad0daf5e2e",
+      "grad_scaler": "sha256:dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91",
+      "identity": "34d769f649d7268a4975c57d0baf21e04ab8677368cfd140dfca392fa0044be5",
+      "kappa": "sha256:deec069e6b162ab4644a23244a8ec9dc4c481e38074e97fb1b0857113dfde871",
+      "logging": "sha256:dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91",
+      "memory": "sha256:bb4ef75a1bea57a601273f46e6994756fcb3b9c25de3f45c6498f60b0f715088",
+      "models": "sha256:fa1187ea1be16d8eed49b9faca9133850d00af35819ffa1c95a8205c03cc770b",
+      "optimizers": "sha256:7003bb3bde03779ed7934946f8d4b53aa3ccdde6afbece2f72bd7cfbe422b6c4",
+      "reference": "sha256:fea73172de3d5d46221eb44f8eceae3be1aa8596aea74ce2b206b967037f28db",
+      "rng": "sha256:42fe010626954f1e01395b9cda23e64b66cb7b0f44db23caddc3408e5826e719",
+      "schedulers": "sha256:dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91",
+      "tree": "sha256:42247e8ab1a037480f53d330cc9cc10bf11edc20d1efb552d2b7ca187f206e81",
+      "warnings": "sha256:f9df0c0f4b45f75ba5e79ee97879b86da18c8a393e7da79b4c180fc560dc11e6",
+      "watchdog": "sha256:dc937b59892604f5a86ac96936cd7ff09e25f18ae6b758e8014a24c7fa039e91"
+    },
+    "epochs": [
+      {
+        "entropy": 0.6532634496688843,
+        "kappa": 1.0004937285261046,
+        "loss": -0.15768831223249435,
+        "signal": {
+          "peer-1": 0.8265304863452911,
+          "peer-2": 0.25
+        },
+        "steps": 2,
+        "weights": {
+          "peer-1": 0.6,
+          "peer-2": 0.40000000000000013
+        }
+      },
+      {
+        "entropy": 0.6931471824645996,
+        "kappa": 1.001631231389682,
+        "loss": -0.17095817625522614,
+        "signal": {
+          "peer-1": 0.26217056810855865,
+          "peer-2": 0.26217056810855865
+        },
+        "steps": 2,
+        "weights": {
+          "peer-1": 0.5,
+          "peer-2": 0.5
+        }
+      },
+      {
+        "entropy": 0.6931471824645996,
+        "kappa": 1.003348131156985,
+        "loss": -0.3285621404647827,
+        "signal": {
+          "peer-1": 0.5258888602256775,
+          "peer-2": 0.5258888602256775
+        },
+        "steps": 2,
+        "weights": {
+          "peer-1": 0.5,
+          "peer-2": 0.5
+        }
+      }
+    ],
+    "rng_after": "4bcb3d354b6eafca1d6e9fbe99058f9ca7280e2921611ab3929fc6026192be12"
+  }
+}

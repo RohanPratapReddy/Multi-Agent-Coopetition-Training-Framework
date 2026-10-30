@@ -40,6 +40,7 @@ __all__ = [
     "EpochRecord",
     "FileSink",
     "HealthRecord",
+    "MutationRecord",
     "JsonlSink",
     "LogRecord",
     "LogSink",
@@ -178,6 +179,11 @@ class CheckpointRecord(LogRecord):
 @dataclass(frozen=True)
 class HealthRecord(LogRecord):
     kind: str = "health"
+
+
+@dataclass(frozen=True)
+class MutationRecord(LogRecord):
+    kind: str = "mutation"
 
 
 @dataclass(frozen=True)
@@ -829,6 +835,28 @@ class MACTFLogger:
                 HealthRecord,
                 level=level,
                 epoch=int(payload.get("epoch", 0) or 0),
+                fields=payload,
+            )
+        )
+
+    def mutation(self, report: Any, **fields: Any) -> None:
+        """One record per committed plan: what changed, who asked, and the digests that prove it."""
+        payload = dict(fields)
+        if hasattr(report, "as_dict"):
+            payload.update(report.as_dict())
+        elif isinstance(report, Mapping):
+            payload.update(dict(report))
+        warned = bool(payload.get("warnings"))
+        label = str(payload.get("label", "") or "")
+        source = str(payload.get("source", "") or "")
+        self.log(
+            self._record(
+                MutationRecord,
+                level="warning" if warned else "info",
+                epoch=int(payload.get("epoch", 0) or 0),
+                message=f"{label or 'mutation'} ({source}): "
+                f"+{len(payload.get('added', ()))} -{len(payload.get('purged', ()))} "
+                f"retired {len(payload.get('retired', ()))} revived {len(payload.get('revived', ()))}",
                 fields=payload,
             )
         )

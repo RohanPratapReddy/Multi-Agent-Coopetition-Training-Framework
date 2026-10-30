@@ -71,6 +71,12 @@ ROUTES: dict[str, str] = {
     "run-checkpoint-rollback": "runs/{run_id}/checkpoints/{episode:int}/rollback",
     "admin-capabilities": "admin/capabilities",
     "admin-config-reload": "admin/config/reload",
+    "component-list": "components",
+    "component-validate": "components/validate",
+    "component-detail": "components/{kind}/{name}",
+    "trainer-validate": "trainers/validate",
+    "run-components": "runs/{run_id}/components",
+    "run-mutation-create": "runs/{run_id}/mutations",
 }
 
 

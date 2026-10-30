@@ -18,7 +18,7 @@ Applied order:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterable
 
 from .rules.catalog import NON_OFFSETTABLE
 from .rules.precedence import PrecedenceDecision, resolve
@@ -33,6 +33,20 @@ if TYPE_CHECKING:  # avoids a circular import at module load time
 #: for a single severe violation, so an inherited void is never cheaper than
 #: owning the breach directly.
 _INHERITED_VOID_FLOOR = 1000.0
+
+#: ``COMPLIANCE.MIN_FLOOR_LAMBDA``'s default. 1.0 equals ``SCORING.DEFAULT_LAMBDA``, and
+#: every built-in lambda of a non-offsettable rule is >= 5, so the default changes nothing.
+DEFAULT_MIN_FLOOR_LAMBDA = 1.0
+
+
+def effective_non_offsettable(configured: Iterable[str] | None = None) -> frozenset[str]:
+    """The non-offsettable set in force: the catalog's, plus anything configured.
+
+    A configuration may *widen* the set (make another rule non-offsettable); it can never
+    narrow it. This is the one place that rule is written; ``PenaltyScorer``,
+    ``ScoringPipeline`` and ``HierarchicalScorer`` all call it.
+    """
+    return NON_OFFSETTABLE | frozenset(str(rule_id) for rule_id in (configured or ()))
 
 
 @dataclass(frozen=True)

@@ -5,16 +5,25 @@
 project mounts it. Do not pass ``namespace=`` to ``include``: the client reverses
 against ``api:``.
 
-Ordering matters in exactly two places, both asserted by tests:
+Ordering matters in exactly three places, both asserted by tests:
 
 * ``rules/validation`` is declared before ``rules/{rule_id}``;
-* ``runs/{run_id}/peers/tree`` is declared before ``runs/{run_id}/peers/{path:path}``.
+* ``runs/{run_id}/peers/tree`` is declared before ``runs/{run_id}/peers/{path:path}``;
+* ``components/validate`` is declared before ``components/{kind}/{name}`` (document 17 section 16.3).
 """
 
 from __future__ import annotations
 
 from ...http.urls import path
 from .views.admin import AdminCapabilitiesView, ConfigReloadView
+from .views.components import (
+    ComponentDetailView,
+    ComponentListView,
+    ComponentValidateView,
+    RunComponentsView,
+    RunMutationView,
+    TrainerValidateView,
+)
 from .views.episodes import (
     AggregationListView,
     EpisodeDetailView,
@@ -140,6 +149,13 @@ urlpatterns = [
         CheckpointRollbackView.as_view(),
         name="run-checkpoint-rollback",
     ),
+    # -- components and mutations (document 17 section 16.3) ----------------------------------
+    path("components", ComponentListView.as_view(), name="component-list"),
+    path("components/validate", ComponentValidateView.as_view(), name="component-validate"),  # before {kind}
+    path("components/{kind}/{name}", ComponentDetailView.as_view(), name="component-detail"),
+    path("trainers/validate", TrainerValidateView.as_view(), name="trainer-validate"),
+    path("runs/{run_id}/components", RunComponentsView.as_view(), name="run-components"),
+    path("runs/{run_id}/mutations", RunMutationView.as_view(), name="run-mutation-create"),
     # -- admin (3.12) ------------------------------------------------------------------------------
     path("admin/capabilities", AdminCapabilitiesView.as_view(), name="admin-capabilities"),
     path("admin/config/reload", ConfigReloadView.as_view(), name="admin-config-reload"),

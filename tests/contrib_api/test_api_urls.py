@@ -11,7 +11,8 @@ from mactf.http import NoReverseMatch, Resolver404, resolve, reverse
 from mactf.http.handler import clear_application_cache
 from mactf.http.urls import clear_url_caches
 
-SAMPLE = {"run_id": "r1", "episode": 3, "rule_id": "P1", "peer": "p0", "name": "p0", "path": "a/b"}
+SAMPLE = {"run_id": "r1", "episode": 3, "rule_id": "P1", "peer": "p0", "name": "p0", "path": "a/b",
+          "kind": "weight_update"}
 
 
 def _named():

@@ -1,0 +1,3 @@
+label: drop-peer-3
+ops:
+  - {op: purge, path: peer-3, reason: "architecture abandoned"}

@@ -60,6 +60,11 @@ class _QuietHandler(WSGIRequestHandler):
 
 
 def build_server(host: str, port: int, *, workers: int | None = None, quiet: bool = True) -> BoundedThreadingWSGIServer:
+    # The registries import their built-ins lazily on first use; two request threads doing that at once
+    # raise an import ``_DeadlockError`` or read a half-filled registry. Do it once, on this thread.
+    from mactf.components.known import import_builtins
+
+    import_builtins()
     application = get_wsgi_application()
     pool = workers or int((get_settings().get("HTTP") or {}).get("STREAM_WORKERS", 16))
 
@@ -118,9 +123,15 @@ class Command(BaseCommand):
                                  "help": "Print one line per request."}),
         (("--port-file",), {"default": None, "metavar": "PATH",
                             "help": "Write the bound port here once listening; removed on exit."}),
+        (("--component-module",), {"action": "append", "default": None, "metavar": "MODULE",
+                                   "dest": "component_modules",
+                                   "help": "Import MODULE and register its components for this server; repeat it."}),
     ]
 
     def handle(self, **options):
+        from mactf.management.runsupport import add_component_modules
+
+        add_component_modules(self.need_settings(), options.get("component_modules"))
         http = self.need_settings().get("HTTP") or {}
         host = options["host"] or http.get("HOST", "127.0.0.1")
         port = options["port"] if options["port"] is not None else int(http.get("PORT", 8000))

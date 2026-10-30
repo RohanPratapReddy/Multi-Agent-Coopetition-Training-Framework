@@ -1,0 +1,8 @@
+# 18.3: a weight-update strategy, per group, with state.
+COMPONENTS: {MODULES: ["mactf.contrib.components.examples.ema_softmax"]}
+ORCHESTRATOR: {ENGINE: trainer}           # the Orchestrator never reads TRAINER.WEIGHT_UPDATE (W002)
+TRAINER:
+  WEIGHT_UPDATE: {type: ema_softmax, params: {alpha: 0.3}}
+  WEIGHT_UPDATE_OVERRIDES:
+    "peer-*": {type: ema_softmax, params: {alpha: 0.6, clip: 2.0}}
+  WEIGHT_GUARD: {MODE: repair, TOLERANCE: 0.001}

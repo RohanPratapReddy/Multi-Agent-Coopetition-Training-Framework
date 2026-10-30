@@ -1281,6 +1281,21 @@ restarting a completed run would make its original scorecard a lie.
 settings under an active loop would make the epoch's provenance ambiguous. On
 success it returns the new `/meta` payload.
 
+### 3.13 Components and mutations
+
+Added by document 17 section 16.3. `components/validate` is declared before
+`components/{kind}/{name}`.
+
+| Method | Path | Name | Scope | Implementation |
+|---|---|---|---|---|
+| GET | `/components` | `component-list` | `read` | every visible component; filters `kind`, `origin`, `locked`; paginated |
+| POST | `/components/validate` | `component-validate` | `read` | validate one spec, untrusted (`import:` refused); 200 / 404 / 422 |
+| GET | `/components/{kind}/{name}` | `component-detail` | `read` | `Component.describe()`; 404 with `E001` |
+| POST | `/trainers/validate` | `trainer-validate` | `read` | validate a whole `TrainerSpec`, every problem at once; 200 / 422 |
+| GET | `/runs/{run_id}/components` | `run-components` | `read` | the run's slots, queued and applied swaps |
+| PATCH | `/runs/{run_id}/components` | `run-components` | `run:write` | queue a spec change for one slot; 202 / 404 / 409 / 422 |
+| POST | `/runs/{run_id}/mutations` | `run-mutation-create` | `run:write` | simulate (`dry_run`) or queue a `MutationPlan`; 200 / 202 / 409 / 422 |
+
 ## 4. Cross-cutting rules
 
 ### 4.1 Errors

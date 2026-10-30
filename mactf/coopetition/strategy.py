@@ -23,39 +23,140 @@ strategy that walks more than one aggregation group.
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from abc import ABC
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Iterable, Mapping, Sequence
 
 import torch
 
+from ..components.legacy import LegacyTable
 from ..exceptions import ContractError, ValidationError
 from .tree import PeerNode, PeerTree, aggregation_groups
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
+    from ..training.coordination import CoordinationContext
     from ..training.protocol import EpochResult, StepResult
     from .aggregation import AggregationReport, Aggregator
     from .weights import WeightUpdateStrategy
 
 __all__ = [
+    "BUILTIN_STRATEGY_TYPES",
     "CooperativeStrategy",
     "FrozenPeerStrategy",
+    "GroupRef",
     "HierarchicalStrategy",
     "IndependentStrategy",
     "KappaSoftmaxStrategy",
     "PEER_STRATEGIES",
     "PeerStrategy",
+    "StrategyTraits",
+    "TreeView",
     "build_peer_strategy",
+    "coordinates_via_context",
+    "defines_nothing",
+    "legacy_dispatch",
+    "traits_of",
+    "tree_view",
 ]
+
+WALK_MODES = ("root", "tree")
+ROOT_LABEL = "root"
 
 #: What a strategy may read from a trainer. Duck-typed so a custom trainer that
 #: only implements ``PeerStrategy``'s surface still works.
 _TRAINER_ATTRS = ("tree", "peers", "weight_update", "aggregator", "kappa")
 
 
+@dataclass(frozen=True)
+class StrategyTraits:
+    """What a strategy promises. Read by ``StrategyPlan`` and ``StrategyGuard``."""
+
+    #: The strategy mixes parameters (``should_aggregate`` for a legacy strategy).
+    aggregates: bool = False
+    #: The strategy adds entries to the freeze set; it must then release them in ``detach``.
+    freezes: bool = False
+    #: How far the strategy reaches when it is the *default*: ``"root"`` serves the root group
+    #: only (the five built-ins' behaviour today, except ``hierarchical``); ``"tree"`` serves
+    #: every group that no override claims. An *override* always serves exactly the groups
+    #: its glob matches, whatever ``walk`` says.
+    walk: str = "root"
+    #: The root group's weights are computed before any child group is written, as
+    #: ``_coordinate`` does for ``hierarchical``. This fixes the order of ``trainer.reports``
+    #: and of the controllers' updates.
+    precompute_root: bool = False
+    #: One instance per group instead of one per slot. State then never crosses groups.
+    per_group: bool = False
+
+    def __post_init__(self) -> None:
+        if self.walk not in WALK_MODES:
+            raise ValidationError(
+                f"StrategyTraits.walk must be one of {list(WALK_MODES)}, got {self.walk!r}"
+            )
+
+
+@dataclass(frozen=True)
+class GroupRef:
+    """One aggregation group. ``label`` is ``"root"`` or the parent node's path."""
+
+    label: str
+    parent: str | None
+    members: tuple[str, ...]
+    level: int
+
+    @property
+    def is_root(self) -> bool:
+        return self.parent is None
+
+
+@dataclass(frozen=True)
+class TreeView:
+    """The tree as a strategy's ``validate`` sees it: groups in ``aggregation_groups`` order."""
+
+    groups: tuple[GroupRef, ...]
+    paths: tuple[str, ...]
+    hierarchy: bool
+
+    def group(self, label: str) -> GroupRef:
+        for item in self.groups:
+            if item.label == label:
+                return item
+        raise ValidationError(
+            f"no aggregation group {label!r}; groups are {[g.label for g in self.groups]}"
+        )
+
+    def labels(self) -> tuple[str, ...]:
+        return tuple(item.label for item in self.groups)
+
+
+def tree_view(tree: PeerTree, *, hierarchy: bool) -> TreeView:
+    groups = tuple(
+        GroupRef(
+            label=ROOT_LABEL if parent is None else parent,
+            parent=parent,
+            members=tuple(members),
+            level=0 if parent is None else int(tree[parent].depth),
+        )
+        for parent, members in aggregation_groups(tree)
+    )
+    return TreeView(
+        groups=groups,
+        paths=tuple(node.path for node in tree.walk("root-first")),
+        hierarchy=bool(hierarchy),
+    )
+
+
 class PeerStrategy(ABC):
-    """Coordination policy for a set of peers."""
+    """Coordination policy for a set of peers.
+
+    A strategy is driven through ``coordinate(ctx)`` (the context API of document 17
+    section 11.6) when it defines that method at least as deep in its class hierarchy as
+    ``on_epoch_end``; otherwise it is *legacy-dispatched* with exactly the calls the trainer
+    always made. ``on_epoch_end`` is no longer abstract: a new-style strategy implements
+    ``coordinate`` and nothing else.
+    """
 
     name: ClassVar[str]
+    traits: ClassVar[StrategyTraits] = StrategyTraits()
 
     def on_epoch_start(self, trainer: Any, epoch: int) -> None:
         """Called at the top of every epoch. The default is a no-op."""
@@ -63,15 +164,34 @@ class PeerStrategy(ABC):
     def on_peer_step(self, trainer: Any, node: PeerNode, result: "StepResult") -> None:
         """Called after each node's training step. The default is a no-op."""
 
-    @abstractmethod
+    # -- new -------------------------------------------------------------
+    def coordinate(self, ctx: "CoordinationContext") -> None:
+        """New-style entry point. Called once per group the strategy serves, deepest first.
+
+        ``ctx.groups`` holds the group(s) of *this* call. The default is a no-op.
+        """
+
+    def attach(self, host: Any) -> None:
+        """Called once when the strategy becomes live (build, swap-in, restore). No-op."""
+
+    def detach(self, host: Any) -> None:
+        """Called once when the strategy stops being live (swap-out, removal). A strategy
+        that froze peers releases them here. No-op."""
+
+    def validate(self, view: TreeView) -> Sequence[str]:
+        """Problems with serving ``view`` (a missing frozen path, a hierarchy it needs and the
+        tree lacks). Reported as ``E074`` at build and after every tree mutation."""
+        return ()
+
+    # -- legacy entry point (no longer abstract) ----------------------------
     def on_epoch_end(
         self, trainer: Any, epoch: int, report: "AggregationReport | None"
     ) -> None:
-        """Called after every node has stepped, before logging."""
+        """Called after every node has stepped, before logging. The default is a no-op."""
 
     def should_aggregate(self) -> bool:
         """Whether this strategy mixes parameters at all."""
-        return False
+        return self.traits.aggregates
 
     def describe(self) -> dict[str, Any]:
         return {"name": self.name, "class": type(self).__name__}
@@ -91,6 +211,69 @@ class PeerStrategy(ABC):
         return build_peer_strategy(spec)
 
 
+def traits_of(strategy: Any) -> StrategyTraits:
+    """The declared traits; for an object that declares none, derived from ``should_aggregate``."""
+    found = getattr(strategy, "traits", None)
+    if isinstance(found, StrategyTraits):
+        return found
+    probe = getattr(strategy, "should_aggregate", None)
+    aggregates = False
+    if callable(probe):
+        try:
+            aggregates = bool(probe())
+        except Exception:  # noqa: BLE001 - a structural strategy that cannot answer is "no"
+            aggregates = False
+    return StrategyTraits(aggregates=aggregates)
+
+
+def _owner(cls: type, attribute: str) -> type:
+    for klass in cls.__mro__:
+        if attribute in vars(klass):
+            return klass
+    return PeerStrategy  # pragma: no cover - PeerStrategy defines both
+
+
+def coordinates_via_context(strategy: Any) -> bool:
+    """Whether ``strategy`` is driven through ``coordinate(ctx)`` (else: legacy dispatch)."""
+    if not isinstance(strategy, PeerStrategy):
+        return False
+    cls = type(strategy)
+    by_context, by_epoch_end = _owner(cls, "coordinate"), _owner(cls, "on_epoch_end")
+    if by_context is PeerStrategy:
+        return False
+    if by_epoch_end is PeerStrategy:
+        return True
+    mro = cls.__mro__
+    return mro.index(by_context) <= mro.index(by_epoch_end)
+
+
+def defines_nothing(strategy: Any) -> bool:
+    """A ``PeerStrategy`` subclass that defines neither entry point (it would do nothing)."""
+    if not isinstance(strategy, PeerStrategy):
+        return False
+    cls = type(strategy)
+    return _owner(cls, "coordinate") is PeerStrategy and _owner(cls, "on_epoch_end") is PeerStrategy
+
+
+def legacy_dispatch(trainer: Any, epoch: int, strategy: Any) -> None:
+    """The calls ``MACTFTrainer._coordinate`` always made, unchanged.
+
+    Used for a strategy that does not define ``coordinate``: a structural object, a
+    subclass that overrides only ``on_epoch_end``, or a pre-existing custom class.
+    """
+    if isinstance(strategy, HierarchicalStrategy):
+        report = trainer.update_weights()
+        strategy.on_epoch_end(trainer, epoch, report)
+    elif isinstance(strategy, (KappaSoftmaxStrategy, FrozenPeerStrategy)):
+        strategy.on_epoch_end(trainer, epoch, None)
+    elif strategy.should_aggregate():
+        report = trainer.update_weights()
+        trainer.aggregate(report)
+        strategy.on_epoch_end(trainer, epoch, report)
+    else:
+        strategy.on_epoch_end(trainer, epoch, None)
+
+
 # ---------------------------------------------------------------------------
 # Non-aggregating strategies
 # ---------------------------------------------------------------------------
@@ -98,6 +281,11 @@ class IndependentStrategy(PeerStrategy):
     """Peers never share parameters. The pre-coopetition behaviour."""
 
     name = "independent"
+    traits = StrategyTraits(aggregates=False, walk="root")
+
+    def coordinate(self, ctx: "CoordinationContext") -> None:
+        for group in ctx.groups:
+            ctx.skip(group, "peers train independently and are never mixed")
 
     def on_epoch_end(
         self, trainer: Any, epoch: int, report: "AggregationReport | None"
@@ -122,6 +310,14 @@ class CooperativeStrategy(PeerStrategy):
     """
 
     name = "cooperative"
+    traits = StrategyTraits(aggregates=False, walk="root")
+
+    def coordinate(self, ctx: "CoordinationContext") -> None:
+        for group in ctx.groups:
+            signals = ctx.signals
+            if not group.is_root:
+                signals = {path: signals[path] for path in group.members if path in signals}
+            ctx.record_signal_sharing(signals)
 
     def on_epoch_end(
         self, trainer: Any, epoch: int, report: "AggregationReport | None"
@@ -150,6 +346,14 @@ class KappaSoftmaxStrategy(PeerStrategy):
     """Delegates to the trainer's configured :class:`WeightUpdateStrategy`."""
 
     name = "kappa_softmax"
+    traits = StrategyTraits(aggregates=True, walk="root")
+
+    def coordinate(self, ctx: "CoordinationContext") -> None:
+        for group in ctx.groups:
+            if group.is_root:
+                ctx.aggregate_root(ctx.update_root())
+            else:
+                ctx.aggregate_group(group)
 
     def on_epoch_end(
         self, trainer: Any, epoch: int, report: "AggregationReport | None"
@@ -183,18 +387,34 @@ class FrozenPeerStrategy(PeerStrategy):
     """
 
     name = "frozen_peer"
+    traits = StrategyTraits(aggregates=True, freezes=True, walk="root")
+    REASON = "strategy:frozen_peer"
 
-    def __init__(self, frozen: str | Sequence[str] = (), *, still_scores: bool = True) -> None:
-        if isinstance(frozen, str):
-            frozen = (frozen,)
-        self.frozen: tuple[str, ...] = tuple(str(path) for path in frozen)
+    def __init__(
+        self,
+        frozen: str | Sequence[str] = (),
+        *,
+        still_scores: bool = True,
+        path: str | Sequence[str] | None = None,     # legacy alias of ``frozen``
+    ) -> None:
+        if path is not None and frozen:
+            raise ValidationError("FrozenPeerStrategy takes 'frozen' or its alias 'path', not both")
+        chosen = path if path is not None else frozen
+        if isinstance(chosen, str):
+            chosen = (chosen,)
+        self.frozen: tuple[str, ...] = tuple(str(item) for item in chosen)
         self.still_scores = bool(still_scores)
         self._marked: list[str] = []
 
+    # The freeze set is the one place that records the freeze, and it mirrors the status
+    # onto the tree (document 17 section 11.4).
     def on_epoch_start(self, trainer: Any, epoch: int) -> None:
         tree = getattr(trainer, "tree", None)
         if tree is None or not self.frozen:
             return
+        freeze = getattr(trainer, "freeze", None)
+        if freeze is not None:
+            freeze.clear_reason(self.REASON)          # the set equals self.frozen, always
         self._marked = []
         for path in self.frozen:
             node = tree.get(path) if isinstance(tree, PeerTree) else None
@@ -202,8 +422,32 @@ class FrozenPeerStrategy(PeerStrategy):
                 raise ContractError(
                     f"FrozenPeerStrategy names {path!r}, which is not a node in this tree"
                 )
-            tree.mark(path, "frozen")
+            if freeze is not None:
+                freeze.add(path, self.REASON)
+            else:                                      # a duck-typed trainer without a freeze set
+                tree.mark(path, "frozen")
             self._marked.append(path)
+
+    def detach(self, host: Any) -> None:
+        freeze = getattr(host, "freeze", None)
+        if freeze is not None:
+            freeze.clear_reason(self.REASON)
+
+    def validate(self, view: TreeView) -> list[str]:
+        known = set(view.paths)
+        return [f"frozen path {path!r} is not a node in the tree" for path in self.frozen
+                if path not in known]
+
+    def coordinate(self, ctx: "CoordinationContext") -> None:
+        for group in ctx.groups:
+            eligible = ctx.eligible_for(group.members) if self.frozen else None
+            if eligible is not None and not any(eligible.values()):
+                ctx.skip(group, "every member is frozen")
+                continue
+            if group.is_root:
+                ctx.aggregate_root(ctx.update_root(eligible=eligible))
+            else:
+                ctx.aggregate_group(group, eligible=eligible)
 
     def eligible(self, names: Iterable[str]) -> dict[str, bool]:
         """The eligibility map the weight update receives."""
@@ -279,6 +523,7 @@ class HierarchicalStrategy(PeerStrategy):
     """
 
     name = "hierarchical"
+    traits = StrategyTraits(aggregates=True, walk="tree", precompute_root=True)
 
     def __init__(
         self,
@@ -289,6 +534,23 @@ class HierarchicalStrategy(PeerStrategy):
         self.update_reference = bool(update_reference)
         self.skip_void_levels = bool(skip_void_levels)
         self.last_reports: dict[str | None, "AggregationReport"] = {}
+
+    def on_epoch_start(self, trainer: Any, epoch: int) -> None:
+        self.last_reports = {}
+
+    def coordinate(self, ctx: "CoordinationContext") -> None:
+        for group in ctx.groups:
+            if group.is_root:
+                report = ctx.update_root()
+                ctx.aggregate_root(report, update_reference=self.update_reference)
+                self.last_reports[None] = report
+                continue
+            if not group.members:
+                continue
+            if self.skip_void_levels and ctx.peers_void(group.members):
+                ctx.skip(group, "every member was voided this epoch")
+                continue
+            self.last_reports[group.parent] = ctx.aggregate_group(group)
 
     def on_epoch_end(
         self, trainer: Any, epoch: int, report: "AggregationReport | None"
@@ -372,50 +634,58 @@ class HierarchicalStrategy(PeerStrategy):
         )
 
 
-#: Every built-in, addressable by name.
-PEER_STRATEGIES: dict[str, type] = {
-    "independent": IndependentStrategy,
-    "cooperative": CooperativeStrategy,
-    "kappa_softmax": KappaSoftmaxStrategy,
-    "frozen_peer": FrozenPeerStrategy,
-    "hierarchical": HierarchicalStrategy,
-}
+#: Every built-in, addressable by name; a view of ``HUB.registry("peer_strategy")``.
+PEER_STRATEGIES: dict[str, type] = LegacyTable(
+    "peer_strategy",
+    {
+        "independent": IndependentStrategy,
+        "cooperative": CooperativeStrategy,
+        "kappa_softmax": KappaSoftmaxStrategy,
+        "frozen_peer": FrozenPeerStrategy,
+        "hierarchical": HierarchicalStrategy,
+    },
+)
+
+#: The framework's own classes: what ``StrategyGuard`` leaves alone under ``SCOPE: custom``.
+BUILTIN_STRATEGY_TYPES: frozenset[type] = frozenset(dict.values(PEER_STRATEGIES))
 
 
 def build_peer_strategy(
     spec: "PeerStrategy | str | Mapping[str, Any] | None",
     *,
     hierarchy: bool = False,
+    resolver: Any | None = None,
+    trusted: bool = True,
 ) -> PeerStrategy:
     """Resolve a strategy from an instance, a name, a spec, or ``None``.
 
-    ``None`` resolves to :class:`HierarchicalStrategy` when ``hierarchy`` is true and
-    :class:`IndependentStrategy` otherwise, which is the documented default in both
-    cases.
+    ``None`` is ``hierarchical`` with a hierarchy and ``independent`` without, as before. A name
+    or mapping goes through the component registry, so it may name a built-in, a project
+    component or a plugin; an unknown name or unaccepted key raises here, with the accepted
+    list (``ComponentMissing`` / ``ComponentParamError`` are ``ValidationError``, 17.1).
     """
+    from ..components.resolver import ComponentResolver, ComponentSpec
+
     if spec is None:
         return HierarchicalStrategy() if hierarchy else IndependentStrategy()
     if isinstance(spec, PeerStrategy):
         return spec
-    if isinstance(spec, str):
-        key = spec.strip().lower()
-        if key not in PEER_STRATEGIES:
-            raise ValidationError(
-                f"unknown peer_strategy {spec!r}; accepted: "
-                + ", ".join(sorted(PEER_STRATEGIES))
-            )
-        return PEER_STRATEGIES[key]()
-    if isinstance(spec, Mapping):
-        payload = dict(spec)
-        key = str(payload.pop("type", payload.pop("name", ""))).lower()
-        if key not in PEER_STRATEGIES:
-            raise ValidationError(
-                f"unknown peer_strategy type {key!r}; accepted: "
-                + ", ".join(sorted(PEER_STRATEGIES))
-            )
-        return PEER_STRATEGIES[key].from_spec(payload)
+    if isinstance(spec, (str, Mapping, ComponentSpec)):
+        raw: Any = spec
+        if isinstance(spec, str):
+            raw = spec.strip().lower()
+        elif isinstance(spec, Mapping):
+            payload = dict(spec)
+            written = payload.pop("name", None)
+            if "type" not in payload and "import" not in payload and written is not None:
+                payload["type"] = written
+            if "type" in payload:
+                payload["type"] = str(payload["type"]).strip().lower()
+            raw = payload
+        parsed = ComponentSpec.parse("peer_strategy", raw)
+        return (resolver or ComponentResolver()).resolve(parsed, trusted=trusted).instance
     if hasattr(spec, "on_epoch_end") and hasattr(spec, "should_aggregate"):
-        return spec  # structural custom strategy
+        return spec  # structural custom strategy: legacy-dispatched
     raise ValidationError(
         f"peer_strategy must be a PeerStrategy, a name, or a mapping; got "
         f"{type(spec).__name__}"

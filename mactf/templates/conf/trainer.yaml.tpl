@@ -13,6 +13,33 @@ TRAINER:
   HIERARCHY: false
   PEER_STRATEGY: kappa_softmax
   WEIGHT_UPDATE: kappa_softmax
+  # Per-group strategies: a glob over group labels ("root", or the parent node's path)
+  # to a name or a {type, params} spec. The most specific glob wins; a tie is an error.
+  WEIGHT_UPDATE_OVERRIDES: {}
+  PEER_STRATEGY_OVERRIDES: {}
+  # What the framework does with a custom strategy's output (document 17 sections 10, 11).
+  WEIGHT_GUARD: {MODE: repair, SCOPE: custom, TOLERANCE: 1.0e-06, PROBE: true}
+  WEIGHT_OPTIONS: {STRICT_GLOBS: true, MIGRATE: reset}
+  STRATEGY_GUARD: {MODE: skip, SCOPE: custom, PROBE: true, CHECK_FROZEN: true}
+  PEER_STRATEGY_OPTIONS: {STRICT_GLOBS: true, MIGRATE: reset}
+  # A registered Aggregator subclass, or null for the built-in.
+  AGGREGATOR: null
+  # legacy | strict. Under strict a frozen peer takes no step and receives no write-back.
+  FREEZE_MODE: legacy
+  # Tree mutation (document 17 section 12). Off until ENABLED is true. MIN_ACTIVE_ROOTS null means
+  # min(2, roots at build); SCHEDULE is a list of {AT_EPOCH, OPS} plans applied at the top of an epoch.
+  MUTATION:
+    ENABLED: false
+    ALLOW_PURGE: true
+    TOMBSTONE: run
+    WATCHDOG_PRUNE: purge
+    STRICT_REPLAY: true
+    JOURNAL_WARN: 1000
+    MAX_OPS_PER_PLAN: 64
+    MAX_PLANS_PER_EPOCH: 4
+    MIN_ACTIVE_ROOTS: null
+    PROTECTED: []
+    SCHEDULE: []
   # independent | shared_trunk | tied_weights. Siblings are averaged, so they must
   # not share parameters; shared_trunk shares a frozen trunk only.
   SHARING: independent

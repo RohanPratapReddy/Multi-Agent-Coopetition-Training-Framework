@@ -9,6 +9,7 @@
 #   - mactf.contrib.coopetition
 #   - mactf.contrib.sandbox
 #   - mactf.contrib.telemetry
+#   - mactf.contrib.components
 #   - "{{ project_name }}.peers"
 #
 # MIDDLEWARE:

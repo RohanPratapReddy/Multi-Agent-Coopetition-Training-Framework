@@ -8,12 +8,17 @@ from ..exceptions import (
     AppRegistryNotReady,
     CapabilityUnavailable,
     CommandError,
+    ComponentBuildError,
+    ComponentCollision,
+    ComponentLocked,
     ImproperlyConfigured,
     InvalidArgument,
     MACTFError,
+    MutationError,
     ResourceNotFound,
     SandboxUnavailable,
     StateConflict,
+    UnsafePolicyDenied,
 )
 
 
@@ -60,6 +65,15 @@ def classify(exc: BaseException) -> tuple[int, str]:
         return int(ExitCode.PIPE), ""
     if isinstance(exc, CommandError):
         return int(exc.returncode), f"CommandError: {message}"
+    # Document 17 section 16.2.2. These derive from ImproperlyConfigured, so they come first.
+    if isinstance(exc, UnsafePolicyDenied):  # a ComponentLocked, but a configuration mistake
+        return int(ExitCode.USAGE), f"ImproperlyConfigured: {message}"
+    if isinstance(exc, (ComponentCollision, ComponentLocked)):
+        return int(ExitCode.CONFLICT), f"Conflict: {message}"
+    if isinstance(exc, MutationError):
+        return int(ExitCode.FAILURE), f"MutationError: {message}"
+    if isinstance(exc, ComponentBuildError):
+        return int(ExitCode.FAILURE), f"ComponentBuildError: {message}"
     if isinstance(exc, (ImproperlyConfigured, AppRegistryNotReady)):
         return int(ExitCode.USAGE), f"ImproperlyConfigured: {message}"
     if isinstance(exc, InvalidArgument):

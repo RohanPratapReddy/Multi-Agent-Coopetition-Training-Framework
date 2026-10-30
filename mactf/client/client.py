@@ -37,7 +37,7 @@ T = TypeVar("T")
 
 __all__ = [
     "MACTFClient", "ObservabilityAPI", "PeersAPI", "PointsEntry", "RulesAPI", "RunsAPI",
-    "SandboxAPI", "ScoresAPI", "ScoringAPI", "TrainersAPI",
+    "ComponentsAPI", "SandboxAPI", "ScoresAPI", "ScoringAPI", "TrainersAPI",
 ]
 
 SCORECARD_V1 = "application/vnd.mactf.v1+json"
@@ -516,6 +516,41 @@ class ObservabilityAPI(_Namespace):
         return self._report("POST", "run-resume", json=body or None, run_id=run_id)
 
 
+class ComponentsAPI(_Namespace):
+    """Components and tree mutations (document 17 section 16.3)."""
+
+    def list(self, *, kind: str | None = None, origin: str | None = None, locked: bool | None = None,
+             limit: int = 50, offset: int = 0) -> Page[Report]:
+        params = {"kind": kind, "origin": origin, "limit": limit, "offset": offset,
+                  "locked": None if locked is None else str(bool(locked)).lower()}
+        return self._page("component-list", Report, params=params)
+
+    def get(self, kind: str, name: str) -> Report:
+        return self._report("GET", "component-detail", kind=kind, name=name)
+
+    def validate(self, kind: str, spec: Mapping[str, Any], *, probe: bool = False) -> Report:
+        """``ValidationFailed`` carries the findings of a spec that does not validate."""
+        return self._report("POST", "component-validate",
+                            json={"kind": kind, "spec": dict(spec), "probe": bool(probe)})
+
+    def validate_trainer(self, spec: Mapping[str, Any]) -> Report:
+        return self._report("POST", "trainer-validate", json=dict(spec))
+
+    def show(self, run_id: str) -> Report:
+        return self._report("GET", "run-components", run_id=run_id)
+
+    def patch(self, run_id: str, slot: str, spec: Mapping[str, Any], *, boundary: str = "episode") -> Report:
+        return self._report("PATCH", "run-components", run_id=run_id,
+                            json={"slot": slot, "spec": dict(spec), "boundary": boundary})
+
+    def mutate(self, run_id: str, *ops: Mapping[str, Any], dry_run: bool = False,
+               label: str | None = None, reason: str | None = None) -> Report:
+        from . import specs
+
+        body = {**specs.mutation(*ops, label=label, reason=reason), "dry_run": bool(dry_run)}
+        return self._report("POST", "run-mutation-create", run_id=run_id, json=body)
+
+
 class MACTFClient:
     """One entry point over either transport.
 
@@ -556,6 +591,7 @@ class MACTFClient:
         self.peers = PeersAPI(self)
         self.sandbox = SandboxAPI(self)
         self.trainers = TrainersAPI(self)
+        self.components = ComponentsAPI(self)
         self.scores = ScoresAPI(self)
         self.observability = ObservabilityAPI(self)
 

@@ -1,0 +1,6 @@
+# 18.7: a training policy with a quarantining step guard.
+COMPONENTS: {MODULES: ["mactf.contrib.components.examples.anchored_policy"]}
+ORCHESTRATOR: {ENGINE: trainer}
+TRAINER:
+  POLICY: {type: anchored, params: {anchor_coefficient: 0.1}}
+  STEP_GUARD: {MODE: quarantine, MAX_CONSECUTIVE: 5}

@@ -1,0 +1,7 @@
+# 18.6: a Huber value loss, a different delta for one node.
+COMPONENTS: {MODULES: ["mactf.contrib.components.examples.huber_value"]}
+RL:
+  LOSS: {type: huber_value, params: {delta: 0.5}}
+  OVERRIDES:
+    LOSS: {"peer-2": {type: huber_value, params: {delta: 2.0}}}
+  VERIFY: custom

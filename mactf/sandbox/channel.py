@@ -137,6 +137,7 @@ class SocketChannel:
         self.connect_timeout = connect_timeout
         self._socket: socket.socket | None = None
         self._reader: FrameReader | None = None
+        self._request_counter = 0
 
     def connect(self, *, deadline: float | None = None) -> "SocketChannel":
         deadline = deadline or time.monotonic() + self.connect_timeout
@@ -171,17 +172,34 @@ class SocketChannel:
     def request(self, kind: str, payload: dict[str, Any] | None = None, *, timeout: float = 30.0) -> Frame:
         if self._reader is None:
             raise SandboxError("channel is not connected")
-        self.send(Frame(kind=kind, payload=payload or {}))
-        response = self._reader.read(timeout=timeout)
-        if response is None:
-            if self._reader.error is not None:
-                raise ProtocolError(str(self._reader.error)) from self._reader.error
-            raise SandboxError(f"timed out waiting for a {kind!r} response after {timeout}s")
-        if response.kind == "error":
-            raise SandboxError(
-                f"guest rejected {kind!r}: {response.payload.get('message', 'no message')}"
-            )
-        return response
+        self._request_counter += 1
+        identifier = self._request_counter
+        self.send(Frame(kind=kind, payload=payload or {}, id=identifier))
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                if self._reader.error is not None:
+                    raise ProtocolError(str(self._reader.error)) from self._reader.error
+                raise SandboxError(
+                    f"timed out waiting for a {kind!r} response after {timeout}s"
+                )
+            response = self._reader.read(timeout=remaining)
+            if response is None:
+                # A reader that reported an error will never produce another
+                # frame, so fail fast rather than spinning until the deadline.
+                if self._reader.error is not None:
+                    raise ProtocolError(str(self._reader.error)) from self._reader.error
+                continue
+            if response.id is not None and response.id != identifier:
+                # With more than one call in flight, a mismatched id is a silent
+                # correctness bug rather than an impossible state, so skip it.
+                continue
+            if response.kind == "error":
+                raise SandboxError(
+                    f"guest rejected {kind!r}: {response.payload.get('message', 'no message')}"
+                )
+            return response
 
     def close(self) -> None:
         if self._reader is not None:

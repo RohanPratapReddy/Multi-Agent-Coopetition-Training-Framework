@@ -1,65 +1,73 @@
-"""``run`` - execute a training run."""
+"""``run`` - execute (start, bound, stop, continue) a training run. Document 16, section 8.2."""
 
 from __future__ import annotations
 
 from ..base import BaseCommand
-from ...conf import get_settings
-from ...exceptions import CommandError
-from ...orchestration.orchestrator import Orchestrator, RunConfig
+from ..driver import RESUME_AUTO, DriveResult, RunDriver, RunPlan, plan_run, present_run_end
+from ..runsupport import device_arg, duration_arg, positive_int, run_id_arg
 
 
 class Command(BaseCommand):
     help = "Run the multi-agent coopetition training loop."
+    description = (
+        "Run the epoch loop. Progress prints one line per epoch. Ctrl-C once pauses the run at the\n"
+        "next epoch boundary so `--resume` can continue it; Ctrl-C twice aborts."
+    )
+    category = "Training"
     requires_system_checks = True
+    output_formats = ("text", "json", "jsonl")
+    examples = (
+        "mactf run --epochs 3",
+        "mactf run --epochs 20 --timeout 2h --run-id nightly-01",
+        "mactf run --resume nightly-01 --epochs 40",
+        "mactf run --branch-from nightly-01:12 --epochs 30 --set COOPETITION.WEIGHT_CAP=0.5",
+        "mactf run --epochs 2 --format jsonl | jq -c 'select(.event == \"epoch\") | .score'",
+    )
     arguments = [
-        (("--epochs",), {"type": int, "default": None}),
-        (("--peers",), {"type": int, "default": None, "help": "Limit the number of peers."}),
-        (("--device",), {"default": None, "help": "auto, cpu, cuda, cuda:0, or mps."}),
+        (("--epochs",), {"type": positive_int, "default": None,
+                         "help": "Total epochs (not additional epochs when resuming)."}),
+        (("--peers",), {"type": positive_int, "default": None, "help": "Limit the number of peers."}),
+        (("--device",), {"type": device_arg, "default": None, "help": "auto, cpu, mps, cuda, or cuda:N."}),
         (("--seed",), {"type": int, "default": None}),
-        (("--redteam",), {"action": "store_true", "default": False}),
-        (("--dry-run",), {"action": "store_true", "default": False}),
-        (("--resume",), {"default": None, "help": "Resume from the latest checkpoint."}),
-        (("--run-id",), {"default": None}),
-        (("--json",), {"action": "store_true", "default": False}),
+        (("--redteam",), {"action": "store_true", "default": False,
+                          "help": "Force the stress pass on for this run."}),
+        (("--no-redteam",), {"action": "store_true", "default": False,
+                             "help": "Force the stress pass off for this run."}),
+        (("--task",), {"default": None, "help": "Task source name, overriding TRAINING.TASK."}),
+        (("--dry-run",), {"action": "store_true", "default": False,
+                          "help": "Build the swarm and record a dry_run row; train nothing."}),
+        (("--resume",), {"nargs": "?", "const": RESUME_AUTO, "default": None, "metavar": "RUN",
+                         "completer": "resumable_run_id",
+                         "help": "Continue a paused or interrupted run under its own id."}),
+        (("--branch-from",), {"default": None, "metavar": "RUN[:EPISODE]", "completer": "run_id",
+                              "help": "Start a new run from a checkpoint of another run."}),
+        (("--run-id",), {"type": run_id_arg, "default": None, "help": "Id for the run (default: generated)."}),
+        (("--timeout",), {"type": duration_arg, "default": None, "metavar": "DURATION",
+                          "help": "Wall-clock budget; the run pauses at the next epoch boundary (exit 124)."}),
+        (("--on-interrupt",), {"choices": ["pause", "cancel"], "default": "pause",
+                               "help": "What Ctrl-C/SIGTERM makes of the run row."}),
+        (("--log-file",), {"default": None, "metavar": "PATH",
+                           "help": "Write the per-run JSONL log here instead of the default location."}),
+        (("--no-log",), {"action": "store_true", "default": False, "help": "Write no per-run log."}),
     ]
+    exclusive = (
+        ("--resume", "--branch-from", "--dry-run"),
+        ("--redteam", "--no-redteam"),
+        ("--log-file", "--no-log"),
+    )
 
     def handle(self, **options):
-        settings = get_settings()
-        config = RunConfig(
-            epochs=options.get("epochs"),
-            peers=options.get("peers"),
-            device=options.get("device"),
-            seed=options.get("seed"),
-            dry_run=bool(options.get("dry_run")),
-            redteam=bool(options.get("redteam")),
-            resume_from=True if options.get("resume") else None,
-            run_id=options.get("run_id"),
+        settings = self.need_settings()
+        if (settings.get("ORCHESTRATOR") or {}).get("ANNOUNCE"):
+            for note in settings.get("_CONF_NOTES") or []:
+                self.out.info(f"  conf     : {note}")
+        plan = plan_run(self, options)
+        result = RunDriver(self).execute(
+            plan, timeout=options["timeout"], on_interrupt=options["on_interrupt"],
+            log_path=options["log_file"], log_enabled=not options["no_log"],
         )
-        orchestrator = Orchestrator(settings)
-        try:
-            summary = orchestrator.run(config)
-        except Exception as exc:  # noqa: BLE001 - surface a clean CLI failure
-            raise CommandError(f"training failed: {exc}") from exc
+        self._finish(plan, result)
+        return result.exit_code
 
-        if options.get("json"):
-            import json
-
-            self.stdout.write(json.dumps(summary, indent=2, default=str) + "\n")
-            return 0
-
-        self.success(f"run {summary['run_id']} [{summary['status']}]")
-        runtime = summary.get("runtime", {})
-        self.success(f"  device   : {runtime.get('device')} dtype={runtime.get('dtype')}")
-        self.success(f"  peers    : {', '.join(summary.get('peers', []))}")
-        self.success(f"  sandbox  : {summary.get('sandbox', 'none')}")
-        for note in summary.get("notes", []):
-            self.success(f"  note     : {note}")
-        for entry in summary.get("history", []):
-            weights = ", ".join(
-                f"{peer}={weight:.3f}" for peer, weight in entry.get("weights", {}).items()
-            )
-            self.success(
-                f"  epoch {entry['epoch']}: score={entry['score']:.4f} "
-                f"kappa={entry['kappa']:.3f} entropy={entry['entropy']:.3f} [{weights}]"
-            )
-        return 0
+    def _finish(self, plan: RunPlan, result: DriveResult) -> None:
+        present_run_end(self, plan, result)

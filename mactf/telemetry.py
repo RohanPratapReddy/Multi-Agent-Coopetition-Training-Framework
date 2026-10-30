@@ -62,14 +62,26 @@ def configure_logging(
         logger.addHandler(stream)
 
     if log_file:
-        path = Path(log_file)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(path, encoding="utf-8")
+        file_handler = _LazyFileHandler(Path(log_file))
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
     _CONFIGURED = True
     return logger
+
+
+class _LazyFileHandler(logging.FileHandler):
+    """A file handler that creates neither the file nor its directory until a record is written.
+
+    A read-only command that logs nothing therefore leaves the project tree untouched.
+    """
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(path, encoding="utf-8", delay=True)
+
+    def _open(self):  # type: ignore[override]
+        Path(self.baseFilename).parent.mkdir(parents=True, exist_ok=True)
+        return super()._open()
 
 
 def get_logger(name: str = "mactf") -> logging.Logger:

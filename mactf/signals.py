@@ -106,8 +106,18 @@ integrity_incident = Signal("integrity_incident")
 aggregation_ready = Signal("aggregation_ready")
 aggregation_completed = Signal("aggregation_completed")
 
+# Distillation lifecycle (document 14 section 12.1)
+distillation_step = Signal("distillation_step")
+distillation_teacher_error = Signal("distillation_teacher_error")
+distillation_sigma_collapsed = Signal("distillation_sigma_collapsed")
+distillation_fallback = Signal("distillation_fallback")
+# Distillation conformance (document 14 section 4.6)
+distillation_conformance_violation = Signal("distillation_conformance_violation")
+distillation_trust_collapsed = Signal("distillation_trust_collapsed")
+
 # Training lifecycle
 phase_started = Signal("phase_started")
+phase_progress = Signal("phase_progress")
 phase_finished = Signal("phase_finished")
 checkpoint_written = Signal("checkpoint_written")
 checkpoint_rolled_back = Signal("checkpoint_rolled_back")

@@ -35,6 +35,12 @@ class TemperatureState:
     delta: float = 0.0
     step: int = 0
     history: list[dict[str, float]] = field(default_factory=list)
+    #: Which score range ``kappa`` was tuned for (document 11 section 8.3).
+    #: Serialized so a resume cannot silently switch the temperature policy.
+    signal_source: str = "final_score"
+    #: The ``KAPPA_INIT`` after source-dependent rescaling, recorded so a reader
+    #: can see why a points-source run starts at a different temperature.
+    scaled_kappa_init: float = 0.0
 
     def describe(self) -> str:
         return (
@@ -58,6 +64,8 @@ class AdaptiveKappa:
         beta: float = 0.9,
         eta_kappa: float = 0.05,
         keep_history: int = 256,
+        signal_source: str = "final_score",
+        scaled_kappa_init: float | None = None,
     ) -> None:
         if num_peers < 1:
             raise ValueError("num_peers must be >= 1")
@@ -82,6 +90,10 @@ class AdaptiveKappa:
         self.state = TemperatureState(
             kappa=min(max(float(kappa_init), self.kappa_min), self.kappa_max),
             target_entropy=max_entropy * self.target_ratio,
+            signal_source=str(signal_source),
+            scaled_kappa_init=float(
+                kappa_init if scaled_kappa_init is None else scaled_kappa_init
+            ),
         )
 
     # -- properties ------------------------------------------------------
@@ -165,6 +177,8 @@ class AdaptiveKappa:
             "beta": self.beta,
             "eta_kappa": self.eta_kappa,
             "target_ratio": self.target_ratio,
+            "signal_source": self.state.signal_source,
+            "scaled_kappa_init": self.state.scaled_kappa_init,
         }
 
     def load_state_dict(self, payload: dict[str, Any]) -> None:
@@ -175,17 +189,62 @@ class AdaptiveKappa:
             payload.get("target_entropy", self.state.target_entropy)
         )
         self.state.step = int(payload.get("step", 0))
+        self.state.signal_source = str(
+            payload.get("signal_source", self.state.signal_source)
+        )
+        self.state.scaled_kappa_init = float(
+            payload.get("scaled_kappa_init", self.state.scaled_kappa_init)
+        )
 
     @classmethod
-    def from_settings(cls, settings: dict[str, Any], *, num_peers: int, ) -> "AdaptiveKappa":
+    def from_settings(
+        cls,
+        settings: dict[str, Any],
+        *,
+        num_peers: int,
+        mean_abs_reference_signal: float | None = None,
+    ) -> "AdaptiveKappa":
+        """Build from ``COOPETITION`` settings, rescaling kappa for the points source.
+
+        ``KAPPA_INIT`` is tuned for the docx ``final_score`` range (roughly
+        ``[-50, +60]``). The points signal is bounded to ``[-1, 1]``, so the same
+        kappa would put the softmax in its near-uniform region and the controller
+        would drive it up until it left it. Document 11 section 8.3 fixes the rule:
+
+            kappa_init_points = kappa_init_final_score / mean_abs_reference_signal
+
+        The reference scale is supplied by the caller because it is a property of
+        the cohort, not the settings. When it is absent the ratio defaults to 10.0,
+        which is the documented default and reproduces ``0.1`` from ``1.0``.
+        """
+        source = str(settings.get("SIGNAL_SOURCE", "final_score")).strip().lower()
+        if source not in ("points", "final_score"):
+            from ..exceptions import ValidationError
+
+            raise ValidationError(
+                "COOPETITION.SIGNAL_SOURCE must be 'points' or 'final_score', "
+                f"got {settings.get('SIGNAL_SOURCE')!r}"
+            )
+        raw_init = float(settings.get("KAPPA_INIT", 1.0))
+        if source == "points":
+            scale = (
+                float(mean_abs_reference_signal)
+                if mean_abs_reference_signal and mean_abs_reference_signal > 0
+                else 10.0
+            )
+            kappa_init = raw_init / scale
+        else:
+            kappa_init = raw_init
         return cls(
             num_peers=num_peers,
-            kappa_init=float(settings.get("KAPPA_INIT", 1.0)),
+            kappa_init=kappa_init,
             kappa_min=float(settings.get("KAPPA_MIN", 0.1)),
             kappa_max=float(settings.get("KAPPA_MAX", 10.0)),
             target_entropy_ratio=float(settings.get("TARGET_ENTROPY_RATIO", 0.8)),
             beta=float(settings.get("BETA_MOMENTUM", 0.9)),
             eta_kappa=float(settings.get("ETA_KAPPA", 0.05)),
+            signal_source=source,
+            scaled_kappa_init=kappa_init,
         )
 
 

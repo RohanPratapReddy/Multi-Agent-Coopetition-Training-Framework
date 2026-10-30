@@ -38,5 +38,10 @@ DEVICE = "auto"
 DTYPE = "auto"
 AMP = True
 
+# No project, so no conf/ directory. The implicit <root>/conf fallback in
+# mactf.conf_files.resolve_conf_dir covers the case where a user runs from a
+# directory that happens to have one.
+CONF_DIR = None
+
 # No overlays: a wheel install ships no YAML.
 CONFIG_FILES: list[str] = []

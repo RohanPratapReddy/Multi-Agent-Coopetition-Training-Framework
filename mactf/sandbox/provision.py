@@ -120,8 +120,15 @@ def write_cloud_init(
     user: str = "mactf",
     packages: list[str] | None = None,
     ssh_authorized_keys: list[str] | None = None,
+    with_agent: bool = False,
+    agent_port: str = "/dev/virtio-ports/mactf.ctl",
 ) -> CloudInitSeed:
-    """Write a NoCloud seed directory usable through QEMU's ``fw_cfg``."""
+    """Write a NoCloud seed directory usable through QEMU's ``fw_cfg``.
+
+    ``with_agent`` appends the guest-agent write_files/runcmd block. When it is
+    false the generated output is byte-identical to the pre-agent version, which
+    existing provisioning tests rely on.
+    """
     target = Path(directory)
     target.mkdir(parents=True, exist_ok=True)
 
@@ -139,13 +146,18 @@ def write_cloud_init(
     if ssh_authorized_keys:
         lines.append("    ssh_authorized_keys:")
         lines.extend(f"      - {key}" for key in ssh_authorized_keys)
+    if with_agent:
+        # Written before runcmd so the unit has a file to run.
+        lines.extend(_agent_write_files())
     lines.extend(
         [
             "runcmd:",
             "  - [ sh, -c, 'echo mactf-ready > /run/mactf.ready' ]",
-            "",
         ]
     )
+    if with_agent:
+        lines.extend(agent_cloud_init_lines(agent_port))
+    lines.append("")
     user_data = "\n".join(lines)
     meta_data = f"instance-id: mactf-{peer}\nlocal-hostname: mactf-{peer}\n"
 
@@ -182,3 +194,87 @@ def seed_payload(directory: Path | str) -> dict[str, Any]:
 def temporary_seed(**kwargs: Any) -> CloudInitSeed:
     directory = Path(tempfile.mkdtemp(prefix="mactf-seed-"))
     return write_cloud_init(directory, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Guest agent provisioning
+# ---------------------------------------------------------------------------
+
+AGENT_INSTALL_PATH = "/opt/mactf/guest_agent.py"
+AGENT_UNIT_PATH = "/etc/systemd/system/mactf-agent.service"
+
+
+def agent_source() -> str:
+    """The guest agent's source text, read from this package."""
+    return (Path(__file__).parent / "guest_agent.py").read_text(encoding="utf-8")
+
+
+def write_guest_agent(directory: Path | str, *, agent_source_text: str | None = None) -> Path:
+    """Copy the agent into the seed directory and return its path.
+
+    The file lands next to ``user-data`` so the cloud-init ``write_files`` block
+    can reference it through the seed directory. It is *also* embedded in
+    ``user-data`` (see :func:`_agent_write_files`) because QEMU's fw_cfg seed
+    delivery does not expose arbitrary extra files as a mounted volume on every
+    image; the copy on the host exists so a caller can inspect or sign it.
+    """
+    target = Path(directory)
+    target.mkdir(parents=True, exist_ok=True)
+    destination = target / "guest_agent.py"
+    destination.write_text(agent_source_text or agent_source(), encoding="utf-8")
+    return destination
+
+
+def _unit_lines(port: str) -> list[str]:
+    return [
+        "[Unit]",
+        "Description=MACTF guest control agent",
+        "After=network.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        f"Environment=MACTF_AGENT_PORT={port}",
+        "Environment=MACTF_AGENT_WORKDIR=/app",
+        "Environment=MACTF_AGENT_PATHS=/app:/tmp/mactf",
+        "ExecStartPre=/bin/mkdir -p /app /tmp/mactf /opt/mactf",
+        f"ExecStart=/usr/bin/python3 {AGENT_INSTALL_PATH}",
+        "Restart=always",
+        "RestartSec=2",
+        "StandardOutput=journal",
+        "StandardError=journal",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+        "",
+    ]
+
+
+def _agent_write_files() -> list[str]:
+    """The ``write_files`` entries that install the agent and its unit."""
+    source = agent_source()
+    indented = ["      " + line for line in source.splitlines()]
+    unit = ["      " + line for line in _unit_lines("/dev/virtio-ports/mactf.ctl")]
+    return [
+        "write_files:",
+        f"  - path: {AGENT_INSTALL_PATH}",
+        "    permissions: '0755'",
+        "    owner: root:root",
+        "    content: |",
+        *indented,
+        f"  - path: {AGENT_UNIT_PATH}",
+        "    permissions: '0644'",
+        "    owner: root:root",
+        "    content: |",
+        *unit,
+    ]
+
+
+def agent_cloud_init_lines(port: str = "/dev/virtio-ports/mactf.ctl") -> list[str]:
+    """The ``runcmd`` block that enables and starts the agent as a unit."""
+    return [
+        f"  - [ sh, -c, 'chmod 0755 {AGENT_INSTALL_PATH}' ]",
+        "  - [ systemctl, daemon-reload ]",
+        "  - [ systemctl, enable, --now, mactf-agent.service ]",
+        f"  - [ sh, -c, 'echo mactf-agent-ready > /run/mactf-agent.ready' ]",
+        f"  # agent port: {port}",
+    ]

@@ -26,6 +26,20 @@ class AppConfig:
     verbose_name: str | None = None
     path: str | None = None
 
+    # Doc 13 section 2: declarative, optional. ``None`` means "try the convention".
+    urls_module: str | None = None
+    migrations_module: str | None = None
+    checks_module: str | None = None
+    commands_module: str | None = None
+
+    #: Submodules imported by :meth:`import_models`, in order. ``urls`` is last
+    #: because it imports ``views``, which imports ``serializers``; a failure should
+    #: carry the name of the module that actually failed.
+    SUBMODULES = (
+        "models", "peers", "providers", "systems", "receivers",
+        "views", "serializers", "urls",
+    )
+
     def __init__(self, name: str) -> None:
         self.name = name
         self.label = self.label or name.rsplit(".", 1)[-1]
@@ -39,17 +53,77 @@ class AppConfig:
 
     # -- lifecycle -------------------------------------------------------
     def import_models(self) -> None:
-        """Import ``models``, ``peers``, ``providers``, and ``systems`` if present."""
-        for submodule in ("models", "peers", "providers", "systems", "receivers"):
-            module_name = f"{self.name}.{submodule}"
-            try:
-                module = importlib.import_module(module_name)
-            except ModuleNotFoundError as exc:
-                if exc.name not in {module_name, self.name}:
-                    raise
+        """Import the conventional submodules (``SUBMODULES``) if present.
+
+        A ``ModuleNotFoundError`` whose ``name`` is the module being imported means
+        "this app has no such module"; anything else is a real failure and propagates.
+        """
+        names = [f"{self.name}.{submodule}" for submodule in self.SUBMODULES]
+        if self.checks_module:
+            names.insert(0, self.checks_module)
+        if self.urls_module:
+            names.append(self.urls_module)
+        seen: set[str] = set()
+        for module_name in names:
+            if module_name in seen:
                 continue
-            self._register_declared(module)
+            seen.add(module_name)
+            module = self._import_optional(module_name)
+            if module is not None:
+                self._register_declared(module)
         self._register_declared(self.module)
+
+    def _import_optional(self, module_name: str) -> Any | None:
+        try:
+            return importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            # ``exc.name`` is the first missing module on the dotted path: the target
+            # itself or one of its absent parents inside this app.
+            missing = exc.name or ""
+            absent_here = module_name == missing or (
+                module_name.startswith(missing + ".") and missing.startswith(self.name)
+            )
+            if not absent_here and missing != self.name:
+                raise
+            return None
+
+    # -- declarative contributions (doc 13 section 2) --------------------------
+    def get_urls(self) -> list[Any]:
+        """The app's ``urlpatterns``. Pure data; no settings reads, no side effects."""
+        module = self._import_optional(self.urls_module or f"{self.name}.urls")
+        if module is None:
+            return []
+        return list(getattr(module, "urlpatterns", []))
+
+    def get_migrations(self) -> dict[int, list[str]]:
+        """``{version: [sql, ...]}`` from ``<migrations_module>.operations``, or ``{}``.
+
+        ``operations`` may be a mapping or a list of ``(version, statements)`` pairs.
+        A list that repeats a version is an ``ImproperlyConfigured``.
+        """
+        module = self._import_optional(self.migrations_module or f"{self.name}.migrations")
+        if module is None:
+            return {}
+        operations = getattr(module, "operations", None)
+        if operations is None:
+            return {}
+        pairs = operations.items() if isinstance(operations, dict) else operations
+        result: dict[int, list[str]] = {}
+        for version, statements in pairs:
+            version = int(version)
+            if version in result:
+                raise ImproperlyConfigured(
+                    f"app {self.label!r} declares migration version {version} more than once"
+                )
+            if isinstance(statements, str):
+                statements = [statements]
+            result[version] = [str(statement) for statement in statements]
+        return result
+
+    def get_commands(self) -> str | None:
+        """The dotted package holding this app's commands, if it exists."""
+        package = self.commands_module or f"{self.name}.management.commands"
+        return package if self._import_optional(package) is not None else None
 
     def _register_declared(self, module: Any) -> None:
         """Register any ``PEERS`` declared by an app module."""

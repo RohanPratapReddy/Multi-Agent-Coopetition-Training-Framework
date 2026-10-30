@@ -12,7 +12,7 @@ import re
 
 # Single source of truth: pyproject.toml resolves this dynamically and the
 # release workflow gates the git tag against it.
-__version__ = "0.0.0rc1"
+__version__ = "0.0.0rc2"
 
 # Numeric release segment only, so pre-release suffixes survive: "1.2.3rc1" -> (1, 2, 3).
 _RELEASE = re.match(r"\d+(?:\.\d+)*", __version__)

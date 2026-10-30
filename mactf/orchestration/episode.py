@@ -9,6 +9,7 @@ from typing import Any, Callable
 import torch
 
 from .. import signals
+from ..data.sources import SyntheticTaskSource
 from ..scoring.ledger import Ledger
 from ..scoring.scorecard import EpisodeScorecard
 
@@ -31,12 +32,13 @@ class Task:
         return f"task[{self.id}] batch={self.batch_size} target={tuple(self.targets.shape)}"
 
 
-class TaskSource:
-    """Generates tasks for an epoch.
+class TaskSource(SyntheticTaskSource):
+    """Compatibility shim over :class:`mactf.data.SyntheticTaskSource`.
 
-    The default source is a deterministic synthetic classification problem so the
-    framework is runnable without external data. Operators replace it by passing
-    their own callable, which is the extension point Django users expect.
+    The generation logic moved to ``mactf.data`` so dataset-backed sources share
+    one protocol, but this name stays available: it is the documented extension
+    point (pass a ``generator`` callable) and existing callers must keep working
+    with byte-identical tensors.
     """
 
     def __init__(
@@ -48,32 +50,19 @@ class TaskSource:
         seed: int = 0,
         generator: Callable[[int, int, int, int], Task] | None = None,
     ) -> None:
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.batch_size = batch_size
-        self.seed = seed
+        super().__init__(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            batch_size=batch_size,
+            seed=seed,
+        )
         self._generator = generator
-        self._counter = 0
 
     def next(self, epoch: int) -> Task:
+        if self._generator is None:
+            return super().next(epoch)
         self._counter += 1
-        if self._generator is not None:
-            return self._generator(epoch, self._counter, self.state_dim, self.action_dim)
-        # Deterministic per (seed, epoch, counter) so reruns are reproducible.
-        local = torch.Generator().manual_seed(
-            hash((self.seed, epoch, self._counter)) % (2**31 - 1)
-        )
-        states = torch.randn(self.batch_size, self.state_dim, generator=local)
-        # A learnable rule: the correct class is the argmax of a fixed projection.
-        projection = torch.randn(self.state_dim, self.action_dim, generator=local)
-        targets = (states @ projection).argmax(dim=-1)
-        return Task(
-            id=f"epoch{epoch}-task{self._counter}",
-            states=states,
-            targets=targets,
-            prompt="synthetic classification",
-            metadata={"source": "synthetic", "epoch": epoch},
-        )
+        return self._generator(epoch, self._counter, self.state_dim, self.action_dim)
 
 
 @dataclass

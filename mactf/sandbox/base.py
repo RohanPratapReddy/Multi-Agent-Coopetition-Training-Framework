@@ -13,6 +13,8 @@ from enum import IntEnum
 from pathlib import Path
 from typing import Any
 
+from ..wire import need, opt
+
 
 class IsolationLevel(IntEnum):
     """Ordered isolation strength."""
@@ -103,6 +105,27 @@ class CapabilityReport:
             "metadata": dict(self.metadata),
         }
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "CapabilityReport":
+        """Inverse of :meth:`as_dict`.
+
+        The wire form carries each capability's availability but not its free-text
+        ``detail``, so rebuilt capabilities have an empty detail; ``as_dict`` does
+        not read it, so the serialized form round-trips exactly.
+        """
+        owner = "CapabilityReport"
+        return cls(
+            provider=str(need(owner, payload, "provider")),
+            isolation=IsolationLevel.parse(need(owner, payload, "isolation")),
+            usable=bool(need(owner, payload, "usable")),
+            capabilities=[
+                Capability(name=str(name), available=bool(available))
+                for name, available in dict(need(owner, payload, "capabilities")).items()
+            ],
+            reasons=[str(item) for item in (payload.get("reasons") or [])],
+            metadata=dict(payload.get("metadata") or {}),
+        )
+
 
 class MissingCapability(Exception):
     """Raised when a provider cannot meet a requested isolation guarantee."""
@@ -163,6 +186,19 @@ class ExecResult:
             "timed_out": self.timed_out,
         }
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ExecResult":
+        owner = "ExecResult"
+        command = need(owner, payload, "command")
+        return cls(
+            command=list(command) if isinstance(command, (list, tuple)) else str(command),
+            stdout=str(opt(payload, "stdout", "")),
+            stderr=str(opt(payload, "stderr", "")),
+            exit_code=int(need(owner, payload, "exit_code")),
+            duration=float(opt(payload, "duration", 0.0)),
+            timed_out=bool(opt(payload, "timed_out", False)),
+        )
+
 
 @dataclass
 class SandboxHandle:
@@ -214,6 +250,14 @@ class SandboxProvider(abc.ABC):
     @abc.abstractmethod
     def stop(self, handle: SandboxHandle, *, force: bool = False) -> None:
         """Shut the sandbox down and release resources."""
+
+    def agent_status(self, handle: SandboxHandle) -> dict[str, Any] | None:
+        """Report the in-guest agent's health, or ``None`` when none is available.
+
+        Optional: a provider that has no guest-side agent does not need to
+        implement it, and ``None`` is the honest answer rather than a fake ok.
+        """
+        return None
 
     def __enter__(self) -> "SandboxProvider":
         return self

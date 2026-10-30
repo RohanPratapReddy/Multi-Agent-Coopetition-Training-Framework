@@ -57,6 +57,39 @@ shell = [
     "ipython>=8.18",
     "bpython>=0.24",
 ]
+# The ASGI adapter in mactf/http/asgi.py is the only module that imports uvicorn.
+asgi = [
+    "uvicorn[standard]>=0.30",
+]
+# Optional backends for the training wrapper layer.
+scipy = [
+    "scipy>=1.11",
+    "numpy>=1.26",
+]
+peft = [
+    "peft>=0.10",
+    "transformers>=4.40",
+]
+# CUDA-only, so it is deliberately not part of `train`: install mactf[peft,quant] for QLoRA.
+quant = [
+    "bitsandbytes>=0.43",
+]
+train = [
+    "scipy>=1.11",
+    "numpy>=1.26",
+    "peft>=0.10",
+    "transformers>=4.40",
+]
+tensorboard = [
+    "tensorboard>=2.16",
+]
+wandb = [
+    "wandb>=0.17",
+]
+docs = [
+    "mkdocs>=1.6",
+    "mkdocs-material>=9",
+]
 dev = [
     "pytest>=8",
     "pytest-cov>=5",
@@ -66,10 +99,10 @@ dev = [
     "twine>=5",
     # tests/test_packaging.py falls back to tomli before 3.11.
     "tomli>=2.0; python_version < '3.11'",
-]
-docs = [
-    "mkdocs>=1.6",
-    "mkdocs-material>=9",
+    "uvicorn[standard]>=0.30",
+    "scipy>=1.11",
+    "peft>=0.10",
+    "transformers>=4.40",
 ]
 
 [project.scripts]
@@ -95,13 +128,20 @@ exclude = ["tests*", "training*", "scripts*", "docs*", "var*"]
 mactf = ["py.typed"]
 "mactf.templates.project" = [
     "*.tpl",
-    "configs/*.tpl",
     "peers/*.tpl",
 ]
+"mactf.templates.conf" = ["*.tpl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+markers = [
+    "needs_torch: imports the orchestrator or a peer; skipped when torch is not installed",
+    "subprocess: starts a child interpreter (signals, real stdout bytes)",
+    "shell: needs a real shell binary (bash, zsh, fish, PowerShell)",
+    "posix: skipped on Windows",
+    "windows: skipped elsewhere",
+]
 
 [tool.ruff]
 line-length = 100

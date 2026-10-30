@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 
 from ...apps import AppConfig
-from ...runtime import Runtime
 from ...telemetry import configure_logging
 
 

@@ -24,45 +24,9 @@ import torch.nn as nn
 
 from .. import signals
 from ..exceptions import ComplianceError
+from .report import AggregationReport
 from .adapter import PeerAdapter
 from .temperature import AdaptiveKappa
-
-
-@dataclass
-class AggregationReport:
-    """Full derivation of one aggregation step."""
-
-    weights: dict[str, float]
-    raw_weights: dict[str, float]
-    kappa: float
-    entropy: float
-    adjustments: list[str] = field(default_factory=list)
-    fallback: bool = False
-    gated_peers: tuple[str, ...] = ()
-    trimmed_peers: tuple[str, ...] = ()
-    order: tuple[str, ...] = ()
-
-    def describe(self) -> str:
-        pairs = ", ".join(f"{peer}={weight:.4f}" for peer, weight in self.weights.items())
-        detail = f"kappa={self.kappa:.4f} H={self.entropy:.4f} weights[{pairs}]"
-        if self.adjustments:
-            detail += " adjustments[" + "; ".join(self.adjustments) + "]"
-        if self.fallback:
-            detail += " FALLBACK=reference"
-        return detail
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "weights": dict(self.weights),
-            "raw_weights": dict(self.raw_weights),
-            "kappa": self.kappa,
-            "entropy": self.entropy,
-            "adjustments": list(self.adjustments),
-            "fallback": self.fallback,
-            "gated_peers": list(self.gated_peers),
-            "trimmed_peers": list(self.trimmed_peers),
-            "order": list(self.order),
-        }
 
 
 @dataclass

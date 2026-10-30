@@ -100,6 +100,7 @@ def choose_provider(
                     f"provider {requested!r} is not usable: {'; '.join(report.reasons)}"
                 )
             choice = _fallback(instances, by_name, target, allow_fallback)
+            choice.requested = requested
             choice.reasons.extend(report.reasons)
             return choice
         choice = ProviderChoice(

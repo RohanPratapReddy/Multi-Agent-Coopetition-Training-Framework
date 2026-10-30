@@ -4,7 +4,8 @@ name: Deploy
 #
 #   push tag v1.0.0      -> test, build, publish to PyPI, verify install, GitHub release
 #   push tag v1.1.0rc1   -> test, build, publish to TestPyPI only
-#   push tag v0.0.0rc1   -> current pre-release: TestPyPI only
+#   push tag v0.1.0      -> first service/client release: PyPI
+#   push tag v0.1.0rc1   -> pre-release: TestPyPI only
 #   manual dispatch      -> test, build, then whatever `target` says
 #
 # Publishing uses OIDC Trusted Publishing, so no API token is stored in the repo.
@@ -46,6 +47,10 @@ jobs:
     outputs:
       publish: ${{ steps.decide.outputs.publish }}
     steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
+
       - name: Classify tag or dispatch input
         id: decide
         shell: bash
@@ -54,11 +59,25 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             target="${{ github.event.inputs.target }}"
           else
+            python -m pip install --quiet packaging
             tag="${GITHUB_REF_NAME#v}"
-            if printf '%s' "$tag" | grep -Eq '^[0-9]+(\.[0-9]+)*$'; then
-              target="pypi"
-            else
-              target="testpypi"
+            # 0.1.0 is a final release; rc/a/b/dev suffixes are pre-releases. Ask
+            # packaging.version, which is what pip and PyPI use, not a regex.
+            target="$(python - "$tag" <<'PY'
+          import sys
+          from packaging.version import InvalidVersion, Version
+
+          try:
+              version = Version(sys.argv[1])
+          except InvalidVersion:
+              print("invalid")
+          else:
+              print("testpypi" if version.is_prerelease or version.is_devrelease else "pypi")
+          PY
+          )"
+            if [ "$target" = "invalid" ]; then
+              echo "::error::tag $GITHUB_REF_NAME is not a PEP 440 version"
+              exit 1
             fi
           fi
           echo "publish=$target" >> "$GITHUB_OUTPUT"
@@ -68,13 +87,19 @@ jobs:
   # Test on every supported interpreter. CPU torch keeps the job small.
   # ---------------------------------------------------------------------
   test:
-    name: Test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # The sandbox and path code has real Windows branches (qemu WINDOWS,
+          # local SYSTEMROOT passthrough) that the install smoke test does not reach.
+          - os: windows-latest
+            python-version: "3.12"
     steps:
       - uses: actions/checkout@v4
 
@@ -97,11 +122,233 @@ jobs:
         run: python -m pytest tests -q
 
   # ---------------------------------------------------------------------
+  # Required checks that each protect one claim. They are separate jobs so a
+  # failure says which claim broke.
+  # ---------------------------------------------------------------------
+  api-contract:
+    name: API contract completeness
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ".[dev]"
+      - name: Contract tests
+        run: >
+          python -m pytest -q
+          tests/contrib_api/test_contract_completeness.py
+          tests/http/test_openapi.py
+          tests/contrib_api/test_api_urls.py
+
+  stdlib-only:
+    name: Standard library only (no extras, no HTTP package)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
+      - name: Build and install the wheel with no extras
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install --no-deps dist/*.whl PyYAML
+      - name: No third-party HTTP package is present
+        run: |
+          python - <<'PY'
+          import importlib.util
+          present = [m for m in ("fastapi", "uvicorn", "httpx", "requests", "pydantic", "starlette")
+                     if importlib.util.find_spec(m)]
+          assert not present, present
+          PY
+      - name: The transport and the client import without one
+        run: |
+          python -c "import mactf.http, mactf.client, sys; bad = {'fastapi','uvicorn','pydantic','httpx'} & set(sys.modules); assert not bad, bad"
+      - name: The client does not import torch
+        run: python -c "import mactf.client; import sys; assert 'torch' not in sys.modules"
+      - name: The server starts
+        env:
+          MACTF_SETTINGS_MODULE: mactf.settings_default
+        run: python -m mactf serve --help
+      - name: Serve and handler tests against a wsgiref server
+        run: |
+          python -m pip install pytest
+          python -m pytest -q tests/contrib_api/test_serve.py tests/http/test_handler.py
+
+  numeric-equivalence:
+    name: Numeric equivalence
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ".[dev]"
+      - name: Equivalence gates
+        run: >
+          python -m pytest -q
+          tests/scoring/test_pipeline_equivalence.py
+          tests/rl/test_loss_functions.py
+          tests/training/test_trainer_equivalence.py
+          tests/hierarchy/test_flat_equivalence.py
+
+  determinism:
+    name: Determinism (PYTHONHASHSEED ${{ matrix.hashseed }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        hashseed: ["0", "12345"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ".[dev]"
+      - name: Determinism gates
+        env:
+          PYTHONHASHSEED: ${{ matrix.hashseed }}
+        run: >
+          python -m pytest -q
+          tests/hierarchy/test_inference_determinism.py
+          tests/checkpoints/test_resume_bit_identical.py
+
+  points-equivalence:
+    name: Points equivalence
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ".[dev]"
+      - name: The rubric did not reach the docx numbers
+        run: >
+          python -m pytest -q
+          tests/scoring/test_points_equivalence.py
+          tests/scoring/test_points_monotone.py
+          tests/scoring/test_normalize_invariants.py
+          tests/scoring/test_points_non_interference.py
+
+  points-parity:
+    name: Points parity over a real server
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ".[dev]"
+      - name: Points routes, scorecard v2 and client parity
+        run: >
+          python -m pytest -q
+          tests/contrib_api/test_points_routes.py
+          tests/contrib_api/test_scorecard_v2.py
+          tests/client/test_points_parity.py
+
+  transport-parity:
+    name: Transport parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ".[dev]"
+      - name: Both transports agree and removing the app removes the API
+        run: >
+          python -m pytest -q
+          tests/client/test_parity.py
+          tests/client/test_from_dict.py
+          tests/contrib_api/test_uninstalled.py
+
+  conf-layout:
+    name: conf/ layout equivalence and shipped templates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION_DEFAULT }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install -e ".[dev]"
+      - name: A conf/ project is the project its settings.py used to be
+        run: >
+          python -m pytest -q
+          tests/test_conf_files.py
+          tests/test_conf_blocks.py
+          tests/test_conf_equivalence.py
+          tests/test_conf_consumers.py
+          tests/test_startproject_conf.py
+          tests/test_packaging.py
+
+  # ---------------------------------------------------------------------
   # Build the wheel and sdist once, then hand them to every publish job.
   # ---------------------------------------------------------------------
   build:
     name: Build distributions
-    needs: [resolve, test]
+    needs:
+      - resolve
+      - test
+      - api-contract
+      - stdlib-only
+      - numeric-equivalence
+      - determinism
+      - points-equivalence
+      - points-parity
+      - transport-parity
+      - conf-layout
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -123,9 +370,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python -m pip install --quiet packaging
           tag="${GITHUB_REF_NAME#v}"
           version="$(python -c 'import mactf; print(mactf.__version__)')"
-          if [ "$tag" != "$version" ]; then
+          same="$(python -c 'import sys; from packaging.version import Version; print(Version(sys.argv[1]) == Version(sys.argv[2]))' "$tag" "$version")"
+          if [ "$same" != "True" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match mactf.__version__ ($version)"
             exit 1
           fi
@@ -139,7 +388,7 @@ jobs:
 
       - name: Show artifact contents
         run: |
-          python -c "import zipfile, glob; z = zipfile.ZipFile(glob.glob('dist/*.whl')[0]); names = z.namelist(); print('wheel entries:', len(names)); print('templates:', sum(n.endswith('.tpl') for n in names)); print('py.typed:', 'mactf/py.typed' in names)"
+          python -c "import zipfile, glob; z = zipfile.ZipFile(glob.glob('dist/*.whl')[0]); names = z.namelist(); print('wheel entries:', len(names)); print('templates:', sum(n.endswith('.tpl') for n in names)); print('py.typed:', 'mactf/py.typed' in names); [print(p, p + '/__init__.py' in names) for p in ('mactf/http','mactf/contrib/api','mactf/client','mactf/testing','mactf/data','mactf/distributed','mactf/training','mactf/rl/functions')]"
 
       - uses: actions/upload-artifact@v4
         with:

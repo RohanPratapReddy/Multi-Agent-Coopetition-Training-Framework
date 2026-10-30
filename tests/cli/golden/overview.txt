@@ -1,0 +1,48 @@
+usage: mactf [global options] <command> [options]
+
+Training
+  redteam       Run adversarial red-team checks against the current swarm.
+  run           Run the multi-agent coopetition training loop.
+
+Runs
+  checkpoints   List, verify, roll back, and prune a run's checkpoints.
+  inspect       Inspect runs, episodes, rule counts, and checkpoints.
+  logs          Read a run's JSONL log.
+  runs          List, inspect, wait for, resume, cancel, and delete runs.
+
+Swarm
+  peers         List the configured peers, describe a peer's contract, preview aggregation weights.
+  rules         List and explain the reward and penalty rules.
+
+Project
+  check         Run framework system checks (rules, scoring, peers, runtime, sandbox).
+  config        Show the effective settings and where each value came from.
+  doctor        Diagnose the environment: Python, torch, GPU, and sandbox isolation.
+  migrate       Create or upgrade the run registry database.
+  sandbox       Manage the QEMU hardware sandbox and inspect isolation capability.
+  shell         Open an interactive shell with settings and apps loaded.
+
+Scaffold
+  startpeer     Scaffold a new peer nn.Module inside an app directory.
+  startproject  Scaffold a new MACTF project (settings, peers, configs, manage.py).
+
+Meta
+  completion    Print a tab-completion script for bash, zsh, fish, or PowerShell.
+  help          Show the commands, or one command's options.
+  version       Print the framework version.
+
+global options (valid before or after the command name):
+  --settings MODULE           Settings module to load (default: the project found from the working directory).
+  --pythonpath PATH           Add a directory to sys.path; repeatable.
+  --config FILE               Overlay a YAML settings file above the environment; repeatable.
+  --set KEY=VALUE             Override one setting, for example TRAINING.EPOCHS=2; repeatable.
+  --no-discover               Do not look for a project; use the framework defaults.
+  --format FORMAT             text, json, jsonl, or yaml, where the command supports it.
+  --json                      Same as --format json.
+  -v / -q                     More / less output; -v may be repeated.
+  --no-color / --force-color  Colour is automatic; NO_COLOR and FORCE_COLOR are honoured.
+  -y, --yes                   Answer yes to the confirmation of a destructive command.
+  --traceback                 Show the Python stack instead of one error line.
+
+Run 'mactf help <command>' for a command's options, 'mactf help --all' to list every
+subcommand, and 'mactf completion <shell>' to enable tab completion.

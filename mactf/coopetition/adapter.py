@@ -147,6 +147,32 @@ class PeerAdapter(nn.Module):
         self._contract_resolved = True
         self.contract.notes.append(f"attached value head over hidden dim {hidden_dim}")
 
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):  # type: ignore[override]
+        """Load a state dict, building the lazily created value head first.
+
+        A head attached at the first forward pass is part of a checkpoint but not of
+        a freshly built adapter, so a resume would otherwise fail with "unexpected
+        key(s): value_head.*". The head's shape is recovered from the checkpoint.
+        """
+        if self.value_head is None and "value_head.0.weight" in state_dict:
+            weight = state_dict["value_head.0.weight"]
+            reference = next(self.module.parameters(), None)
+            hidden_dim = int(weight.shape[1])
+            head = nn.Sequential(
+                nn.Linear(hidden_dim, int(weight.shape[0])),
+                nn.Tanh(),
+                nn.Linear(int(weight.shape[0]), 1),
+            )
+            if reference is not None:
+                head = head.to(device=reference.device, dtype=reference.dtype)
+            self.value_head = head
+            self._contract_resolved = True
+            self.contract.outputs_value = False
+            self.contract.notes.append(
+                f"value head restored from a checkpoint, hidden dim {hidden_dim}"
+            )
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     def _resolve_contract(self, output: Any) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Split a module output into ``(logits, value_or_None)``."""
         if isinstance(output, dict):

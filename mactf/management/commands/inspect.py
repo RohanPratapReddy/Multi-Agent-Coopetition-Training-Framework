@@ -1,83 +1,56 @@
-"""``inspect`` - show a run's scorecards, rule counts, and checkpoints."""
+"""``inspect`` - a run's scorecards, rule counts, and checkpoints. Document 16, section 8.7.
+
+The compatibility front for ``runs show`` and ``runs list``: it delegates to the same
+``collect_run_report``, so the two cannot disagree.
+"""
 
 from __future__ import annotations
 
-import json
-
 from ..base import BaseCommand
-from ...conf import get_settings
-from ...db import Registry
+from ..runsupport import (
+    RUN_COLUMNS,
+    SECTIONS,
+    collect_run_report,
+    lock_dir_for,
+    render_run_report,
+    run_listing,
+    target_run,
+)
+from ...exceptions import ResourceNotFound
 
 
 class Command(BaseCommand):
     help = "Inspect runs, episodes, rule counts, and checkpoints."
+    category = "Runs"
+    output_formats = ("text", "json")
+    examples = ("mactf inspect", "mactf inspect 9f3a --episodes --rules", "mactf inspect --runs --json")
     arguments = [
-        (("target",), {"nargs": "?", "default": None, "help": "Run id, or omit for the latest."}),
+        (("target",), {"nargs": "?", "default": None, "completer": "run_id",
+                       "help": "Run id, or omit for the latest."}),
         (("--runs",), {"action": "store_true", "default": False, "help": "List recent runs."}),
-        (("--episodes",), {"action": "store_true", "default": False}),
-        (("--rules",), {"action": "store_true", "default": False}),
-        (("--checkpoints",), {"action": "store_true", "default": False}),
-        (("--json",), {"action": "store_true", "default": False}),
+        *[((f"--{name}",), {"action": "store_true", "default": False,
+                            "help": f"Include the {name} section."}) for name in SECTIONS],
     ]
 
     def handle(self, **options):
-        settings = get_settings()
-        registry = Registry(settings.database_path())
-        target = options.get("target")
-
-        if options.get("runs"):
-            runs = registry.list_runs(limit=25)
-            if options.get("json"):
-                self.stdout.write(json.dumps(runs, indent=2, default=str) + "\n")
-                return 0
-            if not runs:
-                self.success("no runs recorded")
-                return 0
-            for run in runs:
-                self.success(
-                    f"{run['id']}  {run['status']:<10} "
-                    f"kappa={run['kappa'] if run['kappa'] is not None else '-'} "
-                    f"entropy={run['entropy'] if run['entropy'] is not None else '-'}"
-                )
+        registry = self.registry_for_read()
+        if options["runs"]:
+            rows = registry.list_runs(limit=25) if registry is not None else []
+            # --json keeps printing the registry rows exactly as before: a bare array.
+            self.out.emit(rows, text=lambda: self._list(registry, rows))
             return 0
-
-        if target is None:
-            latest = registry.list_runs(limit=1)
-            if not latest:
-                self.success("no runs recorded; try `manage.py run --epochs 1`")
+        if registry is None or registry.count_runs() == 0:
+            if options["target"] is None:
+                self.out.emit({"run": None}, text=lambda: self.out.result(
+                    f"no runs recorded; try `{self.prog} run --epochs 1`"))
                 return 0
-            target = latest[0]["id"]
-
-        run = registry.get_run(target)
-        if run is None:
-            self.success(f"no such run: {target}")
-            return 1
-
-        self.success(f"run {target} [{run['status']}]")
-        if not options.get("episodes") and not options.get("rules") and not options.get("checkpoints"):
-            self.success(json.dumps(run, indent=2, default=str))
-            return 0
-
-        if options.get("episodes"):
-            for episode in registry.episodes(target):
-                card = episode["scorecard"]
-                scores = {
-                    peer: round(payload["final_score"], 4)
-                    for peer, payload in card.get("peers", {}).items()
-                }
-                self.success(f"  episode {episode['episode']}: {scores}")
-
-        if options.get("rules"):
-            counts = registry.rule_counts(target)
-            if not counts:
-                self.success("  no rule events")
-            for rule_id, count in counts.items():
-                self.success(f"  {rule_id}: {count}")
-
-        if options.get("checkpoints"):
-            for checkpoint in registry.checkpoints(target):
-                self.success(
-                    f"  ep{checkpoint['episode']:>3} kappa={checkpoint['kappa']:.3f} "
-                    f"score={checkpoint['score']:.4f} {checkpoint['path']}"
-                )
+            raise ResourceNotFound("no runs recorded")
+        registry, run_id = target_run(self, options["target"] or "latest")
+        sections = {name for name in SECTIONS if options.get(name)}
+        report = collect_run_report(registry, run_id, sections=sections, lock_dir=lock_dir_for(self))
+        self.out.emit(report, text=lambda: render_run_report(self.out, report))
         return 0
+
+    def _list(self, registry, rows) -> None:
+        items = run_listing(registry, rows, lock_dir_for(self)) if rows else []
+        self.out.table(items, RUN_COLUMNS, empty="no runs recorded")

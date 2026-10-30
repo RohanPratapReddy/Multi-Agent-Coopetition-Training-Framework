@@ -94,9 +94,9 @@ def test_runtime_gpu_reports_when_available():
 # -- registry ------------------------------------------------------------
 def test_registry_migrate_is_idempotent(tmp_path):
     registry = Registry(tmp_path / "test.sqlite3")
-    assert registry.migrate() == [1]
+    assert registry.migrate() == [1, 2, 3]
     assert registry.migrate() == []
-    assert registry.schema_version() == 1
+    assert registry.schema_version() == 3
 
 
 def test_registry_run_lifecycle(tmp_path):

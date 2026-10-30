@@ -9,7 +9,7 @@ warnings can never pool across rules (W6).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 from .. import signals
 from ..rules.catalog import NEVER_WARNING_FIRST, get_rule
@@ -117,6 +117,17 @@ class WarningRegistry:
 
     def count(self, peer: str, rule_id: str) -> int:
         return len(self.active(peer, rule_id))
+
+    def expunge(self, peer: str, rule_id: str) -> int:
+        """Drop every warning for ``(peer, rule_id)`` after a reversal (framework.md W5).
+
+        A reversed finding must leave no residue: the warnings it caused, and the
+        clean-streak bookkeeping for the rule, are removed. Returns how many warning
+        records were removed.
+        """
+        removed = len(self._warnings.get(peer, {}).pop(rule_id, []))
+        self._clean_streak.get(peer, {}).pop(rule_id, None)
+        return removed
 
     # -- lifecycle -------------------------------------------------------
     def begin_episode(self, peer: str, *, episode: int) -> list[WarningRecord]:
@@ -245,6 +256,7 @@ class WarningRegistry:
         return removed
 
     def snapshot(self, peer: str) -> dict[str, Any]:
+        """Human-readable summary of one peer's warning state."""
         return {
             "peer": peer,
             "active": {
@@ -253,6 +265,87 @@ class WarningRegistry:
             },
             "clean_streak": dict(self._clean_streak.get(peer, {})),
         }
+
+    # -- serialization ---------------------------------------------------
+    def to_state(self) -> dict[str, Any]:
+        """A structured, lossless snapshot of every peer's warning state.
+
+        ``snapshot`` is for humans; this is for checkpoints. Expired records are
+        included because framework.md W5 keeps them as part of the audit trail
+        and because expiry is what a resumed run needs in order to derive the
+        clean streak correctly.
+        """
+        return {
+            "policy": {
+                "k_esc": self.policy.k_esc,
+                "n_win": self.policy.n_win,
+                "n_decay": self.policy.n_decay,
+                "w_cap": self.policy.w_cap,
+                "p_warn": self.policy.p_warn,
+                "escalate": self.policy.escalate,
+            },
+            "warnings": {
+                peer: {
+                    rule_id: [
+                        {
+                            "rule_id": record.rule_id,
+                            "episode": record.episode,
+                            "severity": record.severity.label,
+                            "evidence": record.evidence,
+                            "expiry_episode": record.expiry_episode,
+                            "active": record.active,
+                        }
+                        for record in records
+                    ]
+                    for rule_id, records in rules.items()
+                }
+                for peer, rules in self._warnings.items()
+            },
+            "clean_streak": {
+                peer: dict(streaks) for peer, streaks in self._clean_streak.items()
+            },
+        }
+
+    @classmethod
+    def from_state(
+        cls,
+        state: Mapping[str, Any],
+        *,
+        policy: WarningPolicy | None = None,
+    ) -> "WarningRegistry":
+        """Rebuild a registry from :meth:`to_state` output."""
+        policy_payload = state.get("policy") or {}
+        restored_policy = policy or WarningPolicy(
+            k_esc=int(policy_payload.get("k_esc", 3)),
+            n_win=int(policy_payload.get("n_win", 5)),
+            n_decay=int(policy_payload.get("n_decay", 3)),
+            w_cap=int(policy_payload.get("w_cap", 2)),
+            p_warn=float(policy_payload.get("p_warn", 5.0)),
+            escalate=bool(policy_payload.get("escalate", True)),
+        )
+        registry = cls(restored_policy)
+        for peer, rules in (state.get("warnings") or {}).items():
+            for rule_id, records in (rules or {}).items():
+                registry._warnings.setdefault(peer, {})[rule_id] = [
+                    WarningRecord(
+                        rule_id=str(item.get("rule_id", rule_id)),
+                        episode=int(item.get("episode", 0)),
+                        severity=Severity.parse(item.get("severity", "S1")),
+                        evidence=str(item.get("evidence", "")),
+                        expiry_episode=int(item.get("expiry_episode", 0)),
+                        active=bool(item.get("active", True)),
+                    )
+                    for item in records
+                ]
+        for peer, streaks in (state.get("clean_streak") or {}).items():
+            registry._clean_streak[peer] = {key: int(value) for key, value in streaks.items()}
+        return registry
+
+    def restore(self, state: Mapping[str, Any]) -> None:
+        """Replace this registry's state with :meth:`to_state` output."""
+        rebuilt = type(self).from_state(state, policy=self.policy)
+        self._warnings = rebuilt._warnings
+        self._clean_streak = rebuilt._clean_streak
 
     def reset(self) -> None:
         self._warnings.clear()

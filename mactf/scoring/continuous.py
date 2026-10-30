@@ -26,6 +26,7 @@ from typing import Any
 from ..rules.catalog import PENALTIES, REWARDS, Rule
 from ..rules.precedence import PrecedenceDecision, resolve
 from ..rules.severity import Severity, weight_for
+from ..wire import floats, need, strings
 from .ledger import Ledger
 
 
@@ -39,12 +40,21 @@ class RewardBreakdown:
     r_align: float = 0.0
     weights: dict[str, float] = field(default_factory=dict)
     rules: tuple[str, ...] = ()
+    #: Weighted contribution per rule, so the cooperative/competitive split can
+    #: partition the total without recomputing what the score already decided.
+    by_rule: dict[str, float] = field(default_factory=dict)
 
     @property
     def total(self) -> float:
         return sum(
             self.weights.get(bucket, 1.0) * getattr(self, bucket)
             for bucket in ("r_task", "r_epi", "r_collab", "r_align")
+        )
+
+    def rule_total(self, rule_ids: "frozenset[str] | set[str]") -> float:
+        """Sum the weighted contributions of a subset of rules."""
+        return sum(
+            amount for rule_id, amount in self.by_rule.items() if rule_id in rule_ids
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -56,7 +66,21 @@ class RewardBreakdown:
             "total": self.total,
             "rules": list(self.rules),
             "weights": dict(self.weights),
+            "by_rule": dict(self.by_rule),
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RewardBreakdown":
+        """Inverse of :meth:`as_dict`; ``total`` is derived, so it is read and ignored."""
+        return cls(
+            r_task=float(need("RewardBreakdown", payload, "r_task")),
+            r_epi=float(need("RewardBreakdown", payload, "r_epi")),
+            r_collab=float(need("RewardBreakdown", payload, "r_collab")),
+            r_align=float(need("RewardBreakdown", payload, "r_align")),
+            weights=floats(payload.get("weights")),
+            rules=strings(payload.get("rules")),
+            by_rule=floats(payload.get("by_rule")),
+        )
 
 
 @dataclass
@@ -86,6 +110,16 @@ class PenaltyBreakdown:
             "rules": list(self.rules),
         }
 
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "PenaltyBreakdown":
+        """Inverse of :meth:`as_dict`; ``raw_total`` and ``total`` are derived."""
+        return cls(
+            amounts=floats(need("PenaltyBreakdown", payload, "amounts")),
+            omega=float(need("PenaltyBreakdown", payload, "omega")),
+            omega_rules=strings(payload.get("omega_rules")),
+            rules=strings(payload.get("rules")),
+        )
+
 
 @dataclass
 class ContinuousScore:
@@ -97,6 +131,22 @@ class ContinuousScore:
     warning_events: tuple[str, ...] = ()
     decision: PrecedenceDecision | None = None
     suppressed_rewards: tuple[str, ...] = ()
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ContinuousScore":
+        """Inverse of :meth:`as_dict`.
+
+        The precedence decision travels as its ``describe()`` text and is rebuilt
+        from it. ``warning_events`` is not part of the wire form, so it is empty.
+        """
+        precedence = payload.get("precedence")
+        return cls(
+            reward=RewardBreakdown.from_dict(need("ContinuousScore", payload, "reward")),
+            penalty=PenaltyBreakdown.from_dict(need("ContinuousScore", payload, "penalty")),
+            warning=float(need("ContinuousScore", payload, "warning")),
+            decision=PrecedenceDecision.from_description(precedence) if precedence else None,
+            suppressed_rewards=strings(payload.get("suppressed_rewards")),
+        )
 
     @property
     def net(self) -> float:
@@ -121,6 +171,7 @@ def _reward_breakdown(ledger: Ledger, config: dict[str, Any]) -> RewardBreakdown
     weights = {key: float(value) for key, value in config.get("REWARD_WEIGHTS", {}).items()}
     breakdown = RewardBreakdown(weights=weights)
     fired: list[str] = []
+    by_rule: dict[str, float] = {}
     for event in ledger.rewards():
         bucket = event.rule.bucket
         if not hasattr(breakdown, bucket):
@@ -129,9 +180,13 @@ def _reward_breakdown(ledger: Ledger, config: dict[str, Any]) -> RewardBreakdown
         # magnitudes. A reward at S0 contributes nothing.
         magnitudes = config.get("SEVERITY_WEIGHTS") or {}
         scale = float(magnitudes.get(event.resolved_severity().label, 1.0))
-        setattr(breakdown, bucket, getattr(breakdown, bucket) + event.magnitude * scale)
+        contribution = event.magnitude * scale
+        setattr(breakdown, bucket, getattr(breakdown, bucket) + contribution)
+        bucket_weight = weights.get(bucket, 1.0)
+        by_rule[event.rule_id] = by_rule.get(event.rule_id, 0.0) + bucket_weight * contribution
         fired.append(event.rule_id)
     breakdown.rules = tuple(dict.fromkeys(fired))
+    breakdown.by_rule = by_rule
     return breakdown
 
 

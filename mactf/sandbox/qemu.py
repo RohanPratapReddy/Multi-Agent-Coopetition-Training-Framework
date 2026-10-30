@@ -195,12 +195,22 @@ class QemuSandbox(SandboxProvider):
             return True
 
     def _write_cloud_init(self, spec: SandboxSpec) -> Path:
-        """Write a NoCloud seed directory and return its path."""
+        """Write a NoCloud seed directory and return its path.
+
+        The guest agent is installed only when a serial socket is configured,
+        because that is the only configuration in which the agent is reachable.
+        """
         from .provision import temporary_seed
 
         user = str(self.cloud_init.get("USER", "mactf"))
         packages = list(self.cloud_init.get("PACKAGES", ["python3", "python3-pip"]))
-        seed = temporary_seed(peer=spec.peer, user=user, packages=packages)
+        with_agent = bool(spec.serial_socket)
+        seed = temporary_seed(
+            peer=spec.peer,
+            user=user,
+            packages=packages,
+            with_agent=with_agent,
+        )
         self._generated[spec.peer] = seed.directory
         return seed.directory
 
@@ -317,7 +327,13 @@ class QemuSandbox(SandboxProvider):
     def exec(
         self, handle: SandboxHandle, command: list[str] | str, *, timeout: float | None = None
     ) -> ExecResult:
-        """Send a command over the serial channel, or report that none exists."""
+        """Execute a command in the guest over the serial channel.
+
+        A list is sent as argv; a string is sent unchanged so the guest applies
+        shell semantics explicitly. When no serial channel exists the result is
+        a real ``127`` with an explanatory message: that is the accurate outcome
+        of running a command in a VM with no listener, not a stub.
+        """
         from .channel import SocketChannel
 
         endpoint = handle.endpoints.get("serial")
@@ -325,8 +341,10 @@ class QemuSandbox(SandboxProvider):
             return ExecResult(
                 command=command,
                 stderr=(
-                    "no serial channel configured; set SANDBOX.SERIAL_SOCKET and ensure the "
-                    "guest runs the MACTF agent to execute commands inside the VM"
+                    "no serial channel configured, so the guest cannot execute commands; "
+                    "set SANDBOX.SERIAL_SOCKET and provision an image that runs "
+                    "mactf-agent.service (mactf.sandbox.provision.write_cloud_init("
+                    "with_agent=True))"
                 ),
                 exit_code=127,
             )
@@ -336,10 +354,10 @@ class QemuSandbox(SandboxProvider):
                 frame = channel.request(
                     "exec",
                     {
-                        "command": command if isinstance(command, str) else " ".join(command),
+                        "command": command,
                         "timeout": timeout or handle.spec.command_timeout,
                     },
-                    timeout=timeout or handle.spec.command_timeout,
+                    timeout=(timeout or handle.spec.command_timeout) + 5.0,
                 )
                 payload = frame.payload
                 return ExecResult(
@@ -347,7 +365,8 @@ class QemuSandbox(SandboxProvider):
                     stdout=str(payload.get("stdout", "")),
                     stderr=str(payload.get("stderr", "")),
                     exit_code=int(payload.get("exit_code", 0)),
-                    duration=time.monotonic() - started,
+                    duration=float(payload.get("duration", time.monotonic() - started)),
+                    timed_out=bool(payload.get("timed_out", False)),
                 )
         except Exception as exc:  # noqa: BLE001 - surfaced as a failed exec
             return ExecResult(
@@ -356,6 +375,20 @@ class QemuSandbox(SandboxProvider):
                 exit_code=1,
                 duration=time.monotonic() - started,
             )
+
+    def agent_status(self, handle: SandboxHandle) -> dict[str, Any] | None:
+        """Report the guest agent's health, or ``None`` when unreachable."""
+        from .channel import SocketChannel
+
+        endpoint = handle.endpoints.get("serial")
+        if not endpoint:
+            return None
+        try:
+            with SocketChannel(endpoint, connect_timeout=5.0) as channel:
+                frame = channel.request("health", {}, timeout=10.0)
+                return dict(frame.payload)
+        except Exception as exc:  # noqa: BLE001 - status reporting must not raise
+            return {"ready": False, "error": str(exc)}
 
     def stop(self, handle: SandboxHandle, *, force: bool = False) -> None:
         process = self._processes.pop(handle.peer, None)

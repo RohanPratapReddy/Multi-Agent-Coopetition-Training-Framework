@@ -180,6 +180,57 @@ the softmax onto one peer and violates the weight cap.
 
 ---
 
+## Serve and client
+
+The HTTP service is an installed app, selected the way `django.contrib.admin` is.
+Add it to `INSTALLED_APPS` and `mactf serve` exists; remove it and the API, its
+checks and its command are gone, and nothing else changes. It runs on the standard
+library's WSGI server, so there is no web framework to install.
+
+```python
+# settings.py
+INSTALLED_APPS = [
+    "mactf.contrib.scoring", "mactf.contrib.coopetition",
+    "mactf.contrib.sandbox", "mactf.contrib.telemetry",
+    "mactf.contrib.api",
+]
+API = {"ALLOW_ANONYMOUS": False,
+       "TOKENS": {"plain:s3cret": ["read", "run:write", "score:write"]}}
+```
+
+```powershell
+python manage.py serve --port 8010
+```
+
+The client has two transports that return the same objects and raise the same
+exceptions: `HTTPTransport` (standard-library `urllib`) and `InProcessTransport`,
+which dispatches through `ROOT_URLCONF` with no socket.
+
+```python
+from mactf.client import MACTFClient
+
+# against a running server
+client = MACTFClient(transport="http", base_url="http://127.0.0.1:8010", token="s3cret")
+
+run = client.runs.create({"epochs": 2, "seed": 1337, "device": "cpu"})
+for event in client.runs.stream(run.id):          # server-sent events, resumable
+    print(event.type, event.epoch)
+for episode in client.runs.iter_episodes(run.id):
+    for peer, card in episode.peers.items():       # PeerScorecard, the framework's class
+        print(peer, round(card.final_score, 3))
+
+card = client.score("peer-a", [("P1", "fabricated a citation", 1.0)])
+assert card.is_void                                # POST /evaluations
+
+# the same calls with no server at all, in this process
+local = MACTFClient(transport="in_process", token="s3cret")
+assert local.rules.list() == client.rules.list()
+```
+
+`client.scores` reads the 0-100 rubric (`scale()`, `points()`, `normalization()`);
+see [docs/api.md](docs/api.md), [docs/client.md](docs/client.md) and
+[docs/apps.md](docs/apps.md).
+
 ## Layout
 
 ```
@@ -290,23 +341,29 @@ Run `python scripts\check_cuda.py` to re-verify.
 
 ## Known limits
 
-- **No `sandbox exec` without a guest agent.** The virtio-serial channel speaks
-  newline-delimited JSON; the guest-side listener is not included in this build.
-  The host side (`SocketChannel`) and the protocol (`Frame`) are complete and
-  tested. Until the agent is installed in the image, `QemuSandbox.exec` returns
-  exit code 127 with an explicit message rather than pretending to work.
+- **`sandbox exec` needs the guest agent in the image.** A spec with a
+  `serial_socket` gets it installed through cloud-init; without a serial channel,
+  or an image lacking the agent, `exec` answers exit code 127 with an explicit
+  message. The capability matrix and the 127 case are in
+  [docs/sandbox.md](docs/sandbox.md).
 - **`PRECEDENCE_MODE: strict` is deliberately strict.** A T3 epistemic failure
   suppresses T5 task rewards entirely. Set `layered` for full visibility; the
   non-offsettable floor still applies either way.
-- **`JUDGE` is task-verifiable only.** `TaskJudge` records R1/R2/R14 from measured
-  accuracy and calibration. It records *no* penalty for an honest wrong answer,
+- **`TaskJudge` is task-verifiable only, by design.** It records R1/R2/R14 from
+  measured accuracy and calibration and no penalty for an honest wrong answer,
   because framework.md penalizes dishonesty rather than error. Subjective rules
-  (R10 synthesis, P13 collusion, P16 loophole) require an external evaluator to
-  supply its own ledger events.
-- **Warnings are per-run, per-peer, per-rule.** They persist in checkpoints but not
-  in the sqlite registry, so `--resume` restores them only from a checkpoint.
+  (R10 synthesis, P13 collusion, P16 loophole) enter through
+  `mactf/scoring/evaluator.py` and `POST /evaluations`, the ingest path for
+  structured evidence.
 - **Trimming drops the dominant peer, not a statistical outlier.** `TRIM_FRACTION`
   is off by default; enabling it is only sensible with ≥3 peers.
+- **A `trainer` spec on `POST /runs` is validated and stored, not executed.**
+  Orchestrator runs follow the settings; drive `MACTFTrainer` directly for custom
+  trainers ([docs/training.md](docs/training.md)).
+- **The aggregator cap needs two participants.** A cohort of one cannot satisfy the
+  per-peer weight cap, so a hierarchy needs at least two roots.
+- **The API serves one process.** Live runs and the event bus are process-local, so
+  `--workers` above 1 is ignored.
 
 ---
 

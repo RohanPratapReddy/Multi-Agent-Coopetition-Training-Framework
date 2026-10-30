@@ -7,12 +7,17 @@ suppressed, so the decision is auditable rather than implicit.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Iterable
 
 from ..exceptions import ComplianceError
-from .catalog import Rule, TIERS
+from .catalog import Rule, TIERS, get_rule
 from .severity import Severity
+
+_DESCRIPTION = re.compile(
+    r"^tier=(\S+) applied=\[(.*?)\] suppressed=\[(.*?)\] mode=(\S+) \((.*)\)$", re.DOTALL
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +47,35 @@ class PrecedenceDecision:
         return (
             f"tier={tier} applied=[{applied}] suppressed=[{suppressed}] "
             f"mode={self.mode} ({self.rationale})"
+        )
+
+    @classmethod
+    def from_description(cls, text: str) -> "PrecedenceDecision":
+        """The exact inverse of :meth:`describe`, resolving rule ids through the catalog.
+
+        ``describe()`` is the only form a decision takes on the wire, so a client
+        rebuilds the object from it rather than carrying a second encoding.
+        """
+        match = _DESCRIPTION.match(text.strip())
+        if match is None:
+            raise ValueError(f"not a precedence description: {text!r}")
+        tier_name, applied, suppressed, mode, rationale = match.groups()
+        tier: int | None = None
+        if tier_name != "none":
+            by_name = {name: number for number, name in TIERS.items()}
+            if tier_name not in by_name:
+                raise ValueError(f"unknown tier {tier_name!r} in precedence description")
+            tier = by_name[tier_name]
+
+        def rules(listing: str) -> tuple[Rule, ...]:
+            return tuple(get_rule(item.strip()) for item in listing.split(",") if item.strip()) if listing != "none" else ()
+
+        return cls(
+            controlling_tier=tier,
+            applied=rules(applied),
+            suppressed=rules(suppressed),
+            mode=mode,
+            rationale=rationale,
         )
 
 

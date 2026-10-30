@@ -19,7 +19,8 @@ from .. import conf
 from ..conf import Settings
 from ..orchestration.orchestrator import Orchestrator
 from ..runtime import Runtime, build_runtime
-from ..scoring.pipeline import Scorer, build_scorer
+from ..scoring.pipeline import ScoringPipeline as Scorer
+from ..scoring.pipeline import build_scorer
 
 
 class ToyPeer(nn.Module):

@@ -42,6 +42,21 @@ are only ever added to. Text layout is for people and may change between release
 | 130 | `INTERRUPTED` | SIGINT or SIGTERM was honoured. |
 | 141 | `PIPE` | The reader of stdout went away (`| head`). |
 
+### Component and mutation failures
+
+Computed by `classify()` from a real instance of each exception.
+
+| Situation | Exception | Code | Exit |
+|---|---|---|---|
+| A settings file or `--set` names an unknown component | `ComponentMissing` | E001 | 2 |
+| A module is not importable from an untrusted surface | `ComponentImportDenied` | E006 | 2 |
+| Registering a name that exists, without `replace` | `ComponentCollision` | E002 | 4 |
+| Replacing or removing a locked component or slot | `ComponentLocked` | E003 | 4 |
+| A policy declared `unsafe` without the operator's allowance | `UnsafePolicyDenied` | E009 | 2 |
+| A component cannot be built from its spec | `ComponentBuildError` | E008 | 1 |
+| A guard violation reaches the top of a command | `WeightGuardViolation` | E063 | 1 |
+| A mutation plan with a hard finding | `MutationError` | E080-E089 | 1 |
+
 ## Commands
 
 **Training**
@@ -64,6 +79,7 @@ are only ever added to. Text layout is for people and may change between release
 
 | Command | Summary |
 |---|---|
+| [`components`](#mactf-components) | List, inspect, validate, scaffold and diff the pluggable training components. |
 | [`peers`](#mactf-peers) | List the configured peers, describe a peer's contract, preview aggregation weights. |
 | [`rules`](#mactf-rules) | List and explain the reward and penalty rules. |
 
@@ -149,6 +165,7 @@ Formats: `text`, `json`, `jsonl`; needs settings.
 | `--on-interrupt {pause,cancel}` | What Ctrl-C/SIGTERM makes of the run row. | `"pause"` |
 | `--log-file PATH` | Write the per-run JSONL log here instead of the default location. |  |
 | `--no-log` | Write no per-run log. |  |
+| `--component-module MODULE` | Import MODULE and register its components for this run; repeat it. Repeatable. |  |
 
 Not allowed together: `--dry-run`, `--resume`, `--branch-from`.
 
@@ -463,6 +480,122 @@ mactf runs delete 9f3a --dry-run
 mactf runs delete --older-than 30d --yes
 ```
 
+### `mactf runs components`
+
+Show or change the components a run uses.
+
+Formats: `text`, `json`, `yaml`; needs settings.
+
+| Argument | Meaning | Default |
+|---|---|---|
+| `action` |  |  |
+| `run_id` |  |  |
+| `[SLOT]` | A slot path such as TRAINER.WEIGHT_UPDATE (required for set). |  |
+| `--spec YAML` | The new spec, or a patch of params only; '-' reads standard input. |  |
+| `--now` | Fail rather than wait if the slot cannot change before the next episode. |  |
+| `--dry-run` | Check the spec and the slot; queue nothing. |  |
+
+```text
+mactf runs components show run-0007
+mactf runs components set run-0007 TRAINER.WEIGHT_UPDATE --spec '{params: {temperature: 2}}'
+```
+
+## `mactf components`
+
+List, inspect, validate, scaffold and diff the pluggable training components.
+
+Formats: `text`, `json`, `yaml`; needs settings; destructive: asks first; `--yes` skips the question.
+
+### `mactf components list`
+
+List every visible component, optionally of one kind.
+
+Formats: `text`, `json`, `yaml`; needs settings; aliases: `ls`.
+
+| Argument | Meaning | Default |
+|---|---|---|
+| `--kind KIND` | Only this kind, e.g. scorer or rl_function.loss. |  |
+| `--origin {builtin,plugin,project,runtime}` | Only components registered by this origin. |  |
+| `--locked` | Only components matched by COMPONENTS.LOCKED. |  |
+
+```text
+mactf components list
+mactf components list --kind rl_function.loss --origin project
+mactf components list --format json
+```
+
+### `mactf components inspect`
+
+Show one component: origin, mutability, parameters, contract and fingerprint.
+
+Formats: `text`, `json`, `yaml`; needs settings.
+
+| Argument | Meaning | Default |
+|---|---|---|
+| `kind` |  |  |
+| `name` |  |  |
+
+```text
+mactf components inspect weight_update kappa_softmax
+mactf components inspect rl_function.loss policy_gradient --format yaml
+```
+
+### `mactf components validate`
+
+Check a component spec against its contract without starting a run.
+
+Formats: `text`, `json`, `yaml`; needs settings.
+
+| Argument | Meaning | Default |
+|---|---|---|
+| `--kind KIND` | Required. |  |
+| `--name NAME` | The registered name; omit it when --import is given. |  |
+| `--import, --import-path MODULE:ATTR` | Check an importable factory instead of a name. |  |
+| `--param KEY=VALUE` | A parameter; repeat it. VALUE is JSON when it parses. Repeatable. |  |
+| `--spec-file FILE` | A JSON or YAML spec; '-' reads standard input. |  |
+| `--probe` | Also build a throwaway instance and run the author probe. |  |
+
+```text
+mactf components validate --kind weight_update --name trimmed_mean --param trim=0.2
+mactf components validate --kind rl_function.loss --import myproj.losses:Huber --probe
+```
+
+### `mactf components scaffold`
+
+Write a ready-to-edit component module for a kind.
+
+Formats: `text`, `json`, `yaml`; needs settings; destructive: asks first; `--yes` skips the question.
+
+| Argument | Meaning | Default |
+|---|---|---|
+| `kind` |  |  |
+| `name` | The registered name; also the module name (snake_case). |  |
+| `--dir PATH` | Base directory; defaults to <project>/components. |  |
+| `--force` | Overwrite an existing file. |  |
+| `--dry-run` | Print what would be written and write nothing. |  |
+
+```text
+mactf components scaffold weight_update my_trimmed_mean
+mactf components scaffold scorer carbon_cost --dir src/mine --dry-run
+```
+
+### `mactf components diff`
+
+Compare two component manifests: runs, checkpoints, or manifest files.
+
+Formats: `text`, `json`, `yaml`; needs settings.
+
+| Argument | Meaning | Default |
+|---|---|---|
+| `A` | A run id, a checkpoint file, or a manifest file. |  |
+| `B` | The other side; 'live' means the current project settings. |  |
+| `--structural` | Hide changes that cannot alter behaviour (a version bump). |  |
+
+```text
+mactf components diff run-0007 run-0009
+mactf components diff run-0007 live --structural
+```
+
 ## `mactf peers`
 
 List the configured peers, describe a peer's contract, preview aggregation weights.
@@ -524,6 +657,24 @@ Formats: `text`, `json`, `yaml`; needs settings.
 ```text
 mactf peers weights --score alpha=0.8 --score beta=0.6 --score gamma=0.2
 mactf peers weights --scores-file scores.json --eligible gamma=false --format json
+```
+
+### `mactf peers mutate`
+
+Simulate a peer-tree mutation plan, and optionally queue it on a run.
+
+Formats: `text`, `json`, `yaml`; needs settings.
+
+| Argument | Meaning | Default |
+|---|---|---|
+| `FILE` | A MutationPlan as JSON or YAML; '-' reads standard input. |  |
+| `--run RUN_ID` | Simulate against this run's live tree instead of the settings. |  |
+| `--apply` | Queue the plan on --run for the next epoch boundary. |  |
+| `--dry-run` | Simulate only, even with --apply; queue nothing. |  |
+
+```text
+mactf peers mutate plan.yaml
+mactf peers mutate plan.yaml --run run-0007 --apply
 ```
 
 ## `mactf rules`
@@ -840,6 +991,7 @@ Formats: `text`, `jsonl`; needs settings.
 | `--workers WORKERS` | Process count; only 1 is supported. | `1` |
 | `--verbose-access` | Print one line per request. |  |
 | `--port-file PATH` | Write the bound port here once listening; removed on exit. |  |
+| `--component-module MODULE` | Import MODULE and register its components for this server; repeat it. Repeatable. |  |
 
 ```text
 mactf serve

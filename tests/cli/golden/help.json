@@ -729,6 +729,22 @@
           "is_global": false
         },
         {
+          "dest": "component_modules",
+          "flags": [
+            "--component-module"
+          ],
+          "kind": "option",
+          "help": "Import MODULE and register its components for this run; repeat it.",
+          "metavar": "MODULE",
+          "choices": null,
+          "default": null,
+          "required": false,
+          "repeatable": true,
+          "nargs": null,
+          "completer": null,
+          "is_global": false
+        },
+        {
           "dest": "verbose",
           "flags": [
             "-v",
@@ -4967,6 +4983,1501 @@
             }
           ],
           "subcommands": []
+        },
+        {
+          "name": "components",
+          "summary": "Show or change the components a run uses.",
+          "description": "Show or change the components a run uses.",
+          "category": "",
+          "aliases": [],
+          "requires_settings": true,
+          "destructive": false,
+          "formats": [
+            "text",
+            "json",
+            "yaml"
+          ],
+          "examples": [
+            "mactf runs components show run-0007",
+            "mactf runs components set run-0007 TRAINER.WEIGHT_UPDATE --spec '{params: {temperature: 2}}'"
+          ],
+          "exclusive": [],
+          "arguments": [
+            {
+              "dest": "action",
+              "flags": [],
+              "kind": "positional",
+              "help": "",
+              "metavar": null,
+              "choices": [
+                "show",
+                "set"
+              ],
+              "default": null,
+              "required": true,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "run_id",
+              "flags": [],
+              "kind": "positional",
+              "help": "",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": true,
+              "repeatable": false,
+              "nargs": null,
+              "completer": "run_id",
+              "is_global": false
+            },
+            {
+              "dest": "slot",
+              "flags": [],
+              "kind": "positional",
+              "help": "A slot path such as TRAINER.WEIGHT_UPDATE (required for set).",
+              "metavar": "SLOT",
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "?",
+              "completer": "slot_path",
+              "is_global": false
+            },
+            {
+              "dest": "spec",
+              "flags": [
+                "--spec"
+              ],
+              "kind": "option",
+              "help": "The new spec, or a patch of params only; '-' reads standard input.",
+              "metavar": "YAML",
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "now",
+              "flags": [
+                "--now"
+              ],
+              "kind": "flag",
+              "help": "Fail rather than wait if the slot cannot change before the next episode.",
+              "metavar": null,
+              "choices": null,
+              "default": false,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "dry_run",
+              "flags": [
+                "--dry-run"
+              ],
+              "kind": "flag",
+              "help": "Check the spec and the slot; queue nothing.",
+              "metavar": null,
+              "choices": null,
+              "default": false,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "verbose",
+              "flags": [
+                "-v",
+                "--verbose"
+              ],
+              "kind": "count",
+              "help": "More output; repeat for more (-vv shows decisions, -vvv debug logging).",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "quiet",
+              "flags": [
+                "-q",
+                "--quiet"
+              ],
+              "kind": "count",
+              "help": "Less output; only errors and the result with -q.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "format",
+              "flags": [
+                "--format"
+              ],
+              "kind": "option",
+              "help": "Output format (text, json, yaml); text is for humans, the others are a stable contract.",
+              "metavar": null,
+              "choices": [
+                "text",
+                "json",
+                "yaml"
+              ],
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "json",
+              "flags": [
+                "--json"
+              ],
+              "kind": "flag",
+              "help": "Same as --format json.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "no_color",
+              "flags": [
+                "--no-color"
+              ],
+              "kind": "flag",
+              "help": "Never emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "force_color",
+              "flags": [
+                "--force-color"
+              ],
+              "kind": "flag",
+              "help": "Always emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "traceback",
+              "flags": [
+                "--traceback"
+              ],
+              "kind": "flag",
+              "help": "Show the Python stack instead of one error line.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            }
+          ],
+          "subcommands": []
+        }
+      ]
+    },
+    {
+      "name": "components",
+      "summary": "List, inspect, validate, scaffold and diff the pluggable training components.",
+      "description": "List, inspect, validate, scaffold and diff the pluggable training components.",
+      "category": "Swarm",
+      "aliases": [],
+      "requires_settings": true,
+      "destructive": true,
+      "formats": [
+        "text",
+        "json",
+        "yaml"
+      ],
+      "examples": [],
+      "exclusive": [],
+      "arguments": [
+        {
+          "dest": "verbose",
+          "flags": [
+            "-v",
+            "--verbose"
+          ],
+          "kind": "count",
+          "help": "More output; repeat for more (-vv shows decisions, -vvv debug logging).",
+          "metavar": null,
+          "choices": null,
+          "default": 0,
+          "required": false,
+          "repeatable": true,
+          "nargs": "0",
+          "completer": null,
+          "is_global": true
+        },
+        {
+          "dest": "quiet",
+          "flags": [
+            "-q",
+            "--quiet"
+          ],
+          "kind": "count",
+          "help": "Less output; only errors and the result with -q.",
+          "metavar": null,
+          "choices": null,
+          "default": 0,
+          "required": false,
+          "repeatable": true,
+          "nargs": "0",
+          "completer": null,
+          "is_global": true
+        },
+        {
+          "dest": "format",
+          "flags": [
+            "--format"
+          ],
+          "kind": "option",
+          "help": "Output format (text, json, yaml); text is for humans, the others are a stable contract.",
+          "metavar": null,
+          "choices": [
+            "text",
+            "json",
+            "yaml"
+          ],
+          "default": null,
+          "required": false,
+          "repeatable": false,
+          "nargs": null,
+          "completer": null,
+          "is_global": true
+        },
+        {
+          "dest": "json",
+          "flags": [
+            "--json"
+          ],
+          "kind": "flag",
+          "help": "Same as --format json.",
+          "metavar": null,
+          "choices": null,
+          "default": false,
+          "required": false,
+          "repeatable": false,
+          "nargs": "0",
+          "completer": null,
+          "is_global": true
+        },
+        {
+          "dest": "no_color",
+          "flags": [
+            "--no-color"
+          ],
+          "kind": "flag",
+          "help": "Never emit ANSI colour.",
+          "metavar": null,
+          "choices": null,
+          "default": false,
+          "required": false,
+          "repeatable": false,
+          "nargs": "0",
+          "completer": null,
+          "is_global": true
+        },
+        {
+          "dest": "force_color",
+          "flags": [
+            "--force-color"
+          ],
+          "kind": "flag",
+          "help": "Always emit ANSI colour.",
+          "metavar": null,
+          "choices": null,
+          "default": false,
+          "required": false,
+          "repeatable": false,
+          "nargs": "0",
+          "completer": null,
+          "is_global": true
+        },
+        {
+          "dest": "traceback",
+          "flags": [
+            "--traceback"
+          ],
+          "kind": "flag",
+          "help": "Show the Python stack instead of one error line.",
+          "metavar": null,
+          "choices": null,
+          "default": false,
+          "required": false,
+          "repeatable": false,
+          "nargs": "0",
+          "completer": null,
+          "is_global": true
+        },
+        {
+          "dest": "yes",
+          "flags": [
+            "-y",
+            "--yes"
+          ],
+          "kind": "flag",
+          "help": "Answer yes to the confirmation prompt.",
+          "metavar": null,
+          "choices": null,
+          "default": false,
+          "required": false,
+          "repeatable": false,
+          "nargs": "0",
+          "completer": null,
+          "is_global": true
+        },
+        {
+          "dest": "bootstrap_settings",
+          "flags": [
+            "--settings"
+          ],
+          "kind": "option",
+          "help": "Settings module to load.",
+          "metavar": "MODULE",
+          "choices": null,
+          "default": null,
+          "required": false,
+          "repeatable": false,
+          "nargs": null,
+          "completer": null,
+          "is_global": true
+        },
+        {
+          "dest": "bootstrap_pythonpath",
+          "flags": [
+            "--pythonpath"
+          ],
+          "kind": "option",
+          "help": "Add a directory to sys.path; repeatable.",
+          "metavar": "PATH",
+          "choices": null,
+          "default": null,
+          "required": false,
+          "repeatable": true,
+          "nargs": null,
+          "completer": null,
+          "is_global": true
+        },
+        {
+          "dest": "bootstrap_config",
+          "flags": [
+            "--config"
+          ],
+          "kind": "option",
+          "help": "Overlay a YAML settings file above the environment; repeatable.",
+          "metavar": "FILE",
+          "choices": null,
+          "default": null,
+          "required": false,
+          "repeatable": true,
+          "nargs": null,
+          "completer": null,
+          "is_global": true
+        },
+        {
+          "dest": "bootstrap_set",
+          "flags": [
+            "--set"
+          ],
+          "kind": "option",
+          "help": "Override one setting, e.g. TRAINING.EPOCHS=2; repeatable.",
+          "metavar": "KEY=VALUE",
+          "choices": null,
+          "default": null,
+          "required": false,
+          "repeatable": true,
+          "nargs": null,
+          "completer": null,
+          "is_global": true
+        },
+        {
+          "dest": "bootstrap_no_discover",
+          "flags": [
+            "--no-discover"
+          ],
+          "kind": "flag",
+          "help": "Do not look for a project; use the framework defaults.",
+          "metavar": null,
+          "choices": null,
+          "default": null,
+          "required": false,
+          "repeatable": false,
+          "nargs": "0",
+          "completer": null,
+          "is_global": true
+        }
+      ],
+      "subcommands": [
+        {
+          "name": "list",
+          "summary": "List every visible component, optionally of one kind.",
+          "description": "List every visible component, optionally of one kind.",
+          "category": "",
+          "aliases": [
+            "ls"
+          ],
+          "requires_settings": true,
+          "destructive": false,
+          "formats": [
+            "text",
+            "json",
+            "yaml"
+          ],
+          "examples": [
+            "mactf components list",
+            "mactf components list --kind rl_function.loss --origin project",
+            "mactf components list --format json"
+          ],
+          "exclusive": [],
+          "arguments": [
+            {
+              "dest": "kind",
+              "flags": [
+                "--kind"
+              ],
+              "kind": "option",
+              "help": "Only this kind, e.g. scorer or rl_function.loss.",
+              "metavar": "KIND",
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": "component_kind",
+              "is_global": false
+            },
+            {
+              "dest": "origin",
+              "flags": [
+                "--origin"
+              ],
+              "kind": "option",
+              "help": "Only components registered by this origin.",
+              "metavar": null,
+              "choices": [
+                "builtin",
+                "plugin",
+                "project",
+                "runtime"
+              ],
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "locked",
+              "flags": [
+                "--locked"
+              ],
+              "kind": "flag",
+              "help": "Only components matched by COMPONENTS.LOCKED.",
+              "metavar": null,
+              "choices": null,
+              "default": false,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "verbose",
+              "flags": [
+                "-v",
+                "--verbose"
+              ],
+              "kind": "count",
+              "help": "More output; repeat for more (-vv shows decisions, -vvv debug logging).",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "quiet",
+              "flags": [
+                "-q",
+                "--quiet"
+              ],
+              "kind": "count",
+              "help": "Less output; only errors and the result with -q.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "format",
+              "flags": [
+                "--format"
+              ],
+              "kind": "option",
+              "help": "Output format (text, json, yaml); text is for humans, the others are a stable contract.",
+              "metavar": null,
+              "choices": [
+                "text",
+                "json",
+                "yaml"
+              ],
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "json",
+              "flags": [
+                "--json"
+              ],
+              "kind": "flag",
+              "help": "Same as --format json.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "no_color",
+              "flags": [
+                "--no-color"
+              ],
+              "kind": "flag",
+              "help": "Never emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "force_color",
+              "flags": [
+                "--force-color"
+              ],
+              "kind": "flag",
+              "help": "Always emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "traceback",
+              "flags": [
+                "--traceback"
+              ],
+              "kind": "flag",
+              "help": "Show the Python stack instead of one error line.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            }
+          ],
+          "subcommands": []
+        },
+        {
+          "name": "inspect",
+          "summary": "Show one component: origin, mutability, parameters, contract and fingerprint.",
+          "description": "Show one component: origin, mutability, parameters, contract and fingerprint.",
+          "category": "",
+          "aliases": [],
+          "requires_settings": true,
+          "destructive": false,
+          "formats": [
+            "text",
+            "json",
+            "yaml"
+          ],
+          "examples": [
+            "mactf components inspect weight_update kappa_softmax",
+            "mactf components inspect rl_function.loss policy_gradient --format yaml"
+          ],
+          "exclusive": [],
+          "arguments": [
+            {
+              "dest": "kind",
+              "flags": [],
+              "kind": "positional",
+              "help": "",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": true,
+              "repeatable": false,
+              "nargs": null,
+              "completer": "component_kind",
+              "is_global": false
+            },
+            {
+              "dest": "name",
+              "flags": [],
+              "kind": "positional",
+              "help": "",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": true,
+              "repeatable": false,
+              "nargs": null,
+              "completer": "component_name",
+              "is_global": false
+            },
+            {
+              "dest": "verbose",
+              "flags": [
+                "-v",
+                "--verbose"
+              ],
+              "kind": "count",
+              "help": "More output; repeat for more (-vv shows decisions, -vvv debug logging).",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "quiet",
+              "flags": [
+                "-q",
+                "--quiet"
+              ],
+              "kind": "count",
+              "help": "Less output; only errors and the result with -q.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "format",
+              "flags": [
+                "--format"
+              ],
+              "kind": "option",
+              "help": "Output format (text, json, yaml); text is for humans, the others are a stable contract.",
+              "metavar": null,
+              "choices": [
+                "text",
+                "json",
+                "yaml"
+              ],
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "json",
+              "flags": [
+                "--json"
+              ],
+              "kind": "flag",
+              "help": "Same as --format json.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "no_color",
+              "flags": [
+                "--no-color"
+              ],
+              "kind": "flag",
+              "help": "Never emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "force_color",
+              "flags": [
+                "--force-color"
+              ],
+              "kind": "flag",
+              "help": "Always emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "traceback",
+              "flags": [
+                "--traceback"
+              ],
+              "kind": "flag",
+              "help": "Show the Python stack instead of one error line.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            }
+          ],
+          "subcommands": []
+        },
+        {
+          "name": "validate",
+          "summary": "Check a component spec against its contract without starting a run.",
+          "description": "Check a component spec against its contract without starting a run.",
+          "category": "",
+          "aliases": [],
+          "requires_settings": true,
+          "destructive": false,
+          "formats": [
+            "text",
+            "json",
+            "yaml"
+          ],
+          "examples": [
+            "mactf components validate --kind weight_update --name trimmed_mean --param trim=0.2",
+            "mactf components validate --kind rl_function.loss --import myproj.losses:Huber --probe"
+          ],
+          "exclusive": [],
+          "arguments": [
+            {
+              "dest": "kind",
+              "flags": [
+                "--kind"
+              ],
+              "kind": "option",
+              "help": "",
+              "metavar": "KIND",
+              "choices": null,
+              "default": null,
+              "required": true,
+              "repeatable": false,
+              "nargs": null,
+              "completer": "component_kind",
+              "is_global": false
+            },
+            {
+              "dest": "name",
+              "flags": [
+                "--name"
+              ],
+              "kind": "option",
+              "help": "The registered name; omit it when --import is given.",
+              "metavar": "NAME",
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": "component_name",
+              "is_global": false
+            },
+            {
+              "dest": "import_path",
+              "flags": [
+                "--import",
+                "--import-path"
+              ],
+              "kind": "option",
+              "help": "Check an importable factory instead of a name.",
+              "metavar": "MODULE:ATTR",
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "param",
+              "flags": [
+                "--param"
+              ],
+              "kind": "option",
+              "help": "A parameter; repeat it. VALUE is JSON when it parses.",
+              "metavar": "KEY=VALUE",
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": null,
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "spec_file",
+              "flags": [
+                "--spec-file"
+              ],
+              "kind": "option",
+              "help": "A JSON or YAML spec; '-' reads standard input.",
+              "metavar": "FILE",
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": "file",
+              "is_global": false
+            },
+            {
+              "dest": "probe",
+              "flags": [
+                "--probe"
+              ],
+              "kind": "flag",
+              "help": "Also build a throwaway instance and run the author probe.",
+              "metavar": null,
+              "choices": null,
+              "default": false,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "verbose",
+              "flags": [
+                "-v",
+                "--verbose"
+              ],
+              "kind": "count",
+              "help": "More output; repeat for more (-vv shows decisions, -vvv debug logging).",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "quiet",
+              "flags": [
+                "-q",
+                "--quiet"
+              ],
+              "kind": "count",
+              "help": "Less output; only errors and the result with -q.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "format",
+              "flags": [
+                "--format"
+              ],
+              "kind": "option",
+              "help": "Output format (text, json, yaml); text is for humans, the others are a stable contract.",
+              "metavar": null,
+              "choices": [
+                "text",
+                "json",
+                "yaml"
+              ],
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "json",
+              "flags": [
+                "--json"
+              ],
+              "kind": "flag",
+              "help": "Same as --format json.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "no_color",
+              "flags": [
+                "--no-color"
+              ],
+              "kind": "flag",
+              "help": "Never emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "force_color",
+              "flags": [
+                "--force-color"
+              ],
+              "kind": "flag",
+              "help": "Always emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "traceback",
+              "flags": [
+                "--traceback"
+              ],
+              "kind": "flag",
+              "help": "Show the Python stack instead of one error line.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            }
+          ],
+          "subcommands": []
+        },
+        {
+          "name": "scaffold",
+          "summary": "Write a ready-to-edit component module for a kind.",
+          "description": "Write a ready-to-edit component module for a kind.",
+          "category": "",
+          "aliases": [],
+          "requires_settings": true,
+          "destructive": true,
+          "formats": [
+            "text",
+            "json",
+            "yaml"
+          ],
+          "examples": [
+            "mactf components scaffold weight_update my_trimmed_mean",
+            "mactf components scaffold scorer carbon_cost --dir src/mine --dry-run"
+          ],
+          "exclusive": [],
+          "arguments": [
+            {
+              "dest": "kind",
+              "flags": [],
+              "kind": "positional",
+              "help": "",
+              "metavar": null,
+              "choices": [
+                "scorer",
+                "reward_term",
+                "weight_update",
+                "peer_strategy",
+                "rl_function",
+                "optimizer",
+                "scheduler",
+                "trainer_policy"
+              ],
+              "default": null,
+              "required": true,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "name",
+              "flags": [],
+              "kind": "positional",
+              "help": "The registered name; also the module name (snake_case).",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": true,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "dir",
+              "flags": [
+                "--dir"
+              ],
+              "kind": "option",
+              "help": "Base directory; defaults to <project>/components.",
+              "metavar": "PATH",
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": "directory",
+              "is_global": false
+            },
+            {
+              "dest": "force",
+              "flags": [
+                "--force"
+              ],
+              "kind": "flag",
+              "help": "Overwrite an existing file.",
+              "metavar": null,
+              "choices": null,
+              "default": false,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "dry_run",
+              "flags": [
+                "--dry-run"
+              ],
+              "kind": "flag",
+              "help": "Print what would be written and write nothing.",
+              "metavar": null,
+              "choices": null,
+              "default": false,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "verbose",
+              "flags": [
+                "-v",
+                "--verbose"
+              ],
+              "kind": "count",
+              "help": "More output; repeat for more (-vv shows decisions, -vvv debug logging).",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "quiet",
+              "flags": [
+                "-q",
+                "--quiet"
+              ],
+              "kind": "count",
+              "help": "Less output; only errors and the result with -q.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "format",
+              "flags": [
+                "--format"
+              ],
+              "kind": "option",
+              "help": "Output format (text, json, yaml); text is for humans, the others are a stable contract.",
+              "metavar": null,
+              "choices": [
+                "text",
+                "json",
+                "yaml"
+              ],
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "json",
+              "flags": [
+                "--json"
+              ],
+              "kind": "flag",
+              "help": "Same as --format json.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "no_color",
+              "flags": [
+                "--no-color"
+              ],
+              "kind": "flag",
+              "help": "Never emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "force_color",
+              "flags": [
+                "--force-color"
+              ],
+              "kind": "flag",
+              "help": "Always emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "traceback",
+              "flags": [
+                "--traceback"
+              ],
+              "kind": "flag",
+              "help": "Show the Python stack instead of one error line.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "yes",
+              "flags": [
+                "-y",
+                "--yes"
+              ],
+              "kind": "flag",
+              "help": "Answer yes to the confirmation prompt.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            }
+          ],
+          "subcommands": []
+        },
+        {
+          "name": "diff",
+          "summary": "Compare two component manifests: runs, checkpoints, or manifest files.",
+          "description": "Compare two component manifests: runs, checkpoints, or manifest files.",
+          "category": "",
+          "aliases": [],
+          "requires_settings": true,
+          "destructive": false,
+          "formats": [
+            "text",
+            "json",
+            "yaml"
+          ],
+          "examples": [
+            "mactf components diff run-0007 run-0009",
+            "mactf components diff run-0007 live --structural"
+          ],
+          "exclusive": [],
+          "arguments": [
+            {
+              "dest": "left",
+              "flags": [],
+              "kind": "positional",
+              "help": "A run id, a checkpoint file, or a manifest file.",
+              "metavar": "A",
+              "choices": null,
+              "default": null,
+              "required": true,
+              "repeatable": false,
+              "nargs": null,
+              "completer": "run_id",
+              "is_global": false
+            },
+            {
+              "dest": "right",
+              "flags": [],
+              "kind": "positional",
+              "help": "The other side; 'live' means the current project settings.",
+              "metavar": "B",
+              "choices": null,
+              "default": null,
+              "required": true,
+              "repeatable": false,
+              "nargs": null,
+              "completer": "run_id",
+              "is_global": false
+            },
+            {
+              "dest": "structural",
+              "flags": [
+                "--structural"
+              ],
+              "kind": "flag",
+              "help": "Hide changes that cannot alter behaviour (a version bump).",
+              "metavar": null,
+              "choices": null,
+              "default": false,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "verbose",
+              "flags": [
+                "-v",
+                "--verbose"
+              ],
+              "kind": "count",
+              "help": "More output; repeat for more (-vv shows decisions, -vvv debug logging).",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "quiet",
+              "flags": [
+                "-q",
+                "--quiet"
+              ],
+              "kind": "count",
+              "help": "Less output; only errors and the result with -q.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "format",
+              "flags": [
+                "--format"
+              ],
+              "kind": "option",
+              "help": "Output format (text, json, yaml); text is for humans, the others are a stable contract.",
+              "metavar": null,
+              "choices": [
+                "text",
+                "json",
+                "yaml"
+              ],
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "json",
+              "flags": [
+                "--json"
+              ],
+              "kind": "flag",
+              "help": "Same as --format json.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "no_color",
+              "flags": [
+                "--no-color"
+              ],
+              "kind": "flag",
+              "help": "Never emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "force_color",
+              "flags": [
+                "--force-color"
+              ],
+              "kind": "flag",
+              "help": "Always emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "traceback",
+              "flags": [
+                "--traceback"
+              ],
+              "kind": "flag",
+              "help": "Show the Python stack instead of one error line.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            }
+          ],
+          "subcommands": []
         }
       ]
     },
@@ -5723,6 +7234,208 @@
               ],
               "kind": "flag",
               "help": "Step the throwaway temperature controller once.",
+              "metavar": null,
+              "choices": null,
+              "default": false,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "verbose",
+              "flags": [
+                "-v",
+                "--verbose"
+              ],
+              "kind": "count",
+              "help": "More output; repeat for more (-vv shows decisions, -vvv debug logging).",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "quiet",
+              "flags": [
+                "-q",
+                "--quiet"
+              ],
+              "kind": "count",
+              "help": "Less output; only errors and the result with -q.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": true,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "format",
+              "flags": [
+                "--format"
+              ],
+              "kind": "option",
+              "help": "Output format (text, json, yaml); text is for humans, the others are a stable contract.",
+              "metavar": null,
+              "choices": [
+                "text",
+                "json",
+                "yaml"
+              ],
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "json",
+              "flags": [
+                "--json"
+              ],
+              "kind": "flag",
+              "help": "Same as --format json.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "no_color",
+              "flags": [
+                "--no-color"
+              ],
+              "kind": "flag",
+              "help": "Never emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "force_color",
+              "flags": [
+                "--force-color"
+              ],
+              "kind": "flag",
+              "help": "Always emit ANSI colour.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            },
+            {
+              "dest": "traceback",
+              "flags": [
+                "--traceback"
+              ],
+              "kind": "flag",
+              "help": "Show the Python stack instead of one error line.",
+              "metavar": null,
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": true
+            }
+          ],
+          "subcommands": []
+        },
+        {
+          "name": "mutate",
+          "summary": "Simulate a peer-tree mutation plan, and optionally queue it on a run.",
+          "description": "Simulate a peer-tree mutation plan, and optionally queue it on a run.",
+          "category": "",
+          "aliases": [],
+          "requires_settings": true,
+          "destructive": false,
+          "formats": [
+            "text",
+            "json",
+            "yaml"
+          ],
+          "examples": [
+            "mactf peers mutate plan.yaml",
+            "mactf peers mutate plan.yaml --run run-0007 --apply"
+          ],
+          "exclusive": [],
+          "arguments": [
+            {
+              "dest": "plan",
+              "flags": [],
+              "kind": "positional",
+              "help": "A MutationPlan as JSON or YAML; '-' reads standard input.",
+              "metavar": "FILE",
+              "choices": null,
+              "default": null,
+              "required": true,
+              "repeatable": false,
+              "nargs": null,
+              "completer": "file",
+              "is_global": false
+            },
+            {
+              "dest": "run",
+              "flags": [
+                "--run"
+              ],
+              "kind": "option",
+              "help": "Simulate against this run's live tree instead of the settings.",
+              "metavar": "RUN_ID",
+              "choices": null,
+              "default": null,
+              "required": false,
+              "repeatable": false,
+              "nargs": null,
+              "completer": "run_id",
+              "is_global": false
+            },
+            {
+              "dest": "apply",
+              "flags": [
+                "--apply"
+              ],
+              "kind": "flag",
+              "help": "Queue the plan on --run for the next epoch boundary.",
+              "metavar": null,
+              "choices": null,
+              "default": false,
+              "required": false,
+              "repeatable": false,
+              "nargs": "0",
+              "completer": null,
+              "is_global": false
+            },
+            {
+              "dest": "dry_run",
+              "flags": [
+                "--dry-run"
+              ],
+              "kind": "flag",
+              "help": "Simulate only, even with --apply; queue nothing.",
               "metavar": null,
               "choices": null,
               "default": false,

@@ -11,6 +11,7 @@ Runs
   runs          List, inspect, wait for, resume, cancel, and delete runs.
 
 Swarm
+  components    List, inspect, validate, scaffold and diff the pluggable training components.
   peers         List the configured peers, describe a peer's contract, preview aggregation weights.
   rules         List and explain the reward and penalty rules.
 
